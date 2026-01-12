@@ -6,7 +6,7 @@ from flask import Flask
 from threading import Thread
 
 # --- ТВОИ ДАННЫЕ ---
-API_KEY = "sk-0f6ccbcf2ab44b5687a58934e3ae626f"
+API_KEY = "sk-MmL4liaBAGKxeVZ_3WaJ9w"
 BOT_TOKEN = "8503199106:AAEZAWOq7hgC_2NBtgyckhbNl3K3qkbOKL4"
 API_URL = "https://litellm.tokengate.ru/v1/chat/completions"
 
