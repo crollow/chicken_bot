@@ -1,631 +1,493 @@
-import asyncio
-import io
-import logging
-from datetime import datetime
-from typing import Dict, List, Optional
-from collections import defaultdict
-from openai import OpenAI
-from aiohttp import web
 import os
+import io
+import json
+import telebot
+import google.generativeai as genai
+from flask import Flask
+from threading import Thread
+from datetime import datetime
+import html
 
-from aiogram import Bot, Dispatcher, Router, F
-from aiogram.types import Message, CallbackQuery, FSInputFile
-from aiogram.filters import Command, CommandStart
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
-from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.utils.keyboard import InlineKeyboardBuilder
+# --- КОНФИГУРАЦИЯ ---
+GEMINI_API_KEY = "AIzaSyAcxo8c_uO6OI-tpThvuVZeJ7RB71K98C4"  # Получи на https://aistudio.google.com/apikey
+BOT_TOKEN = "8503199106:AAEZAWOq7hgC_2NBtgyckhbNl3K3qkbOKL4"
 
-# ========== КОНФИГУРАЦИЯ ==========
-GROQ_API_KEY = "gsk_твой_ключ_сюда"  # Получи на platform.groq.com
-BOT_TOKEN = "токен_твоего_бота"      # От @BotFather
+bot = telebot.TeleBot(BOT_TOKEN)
+app = Flask('')
 
-# Модель Groq (используй llama-3.3-70b-versatile или mixtral-8x7b)
-GROQ_MODEL = "llama-3.3-70b-versatile"
+# Настройка Gemini
+genai.configure(api_key=GEMINI_API_KEY)
+model = genai.GenerativeModel('gemini-pro')
 
-# ========== НАСТРОЙКА ЛОГГИНГА ==========
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-)
-logger = logging.getLogger(__name__)
+# Хранилище контекста
+user_contexts = {}
 
-# ========== ИНИЦИАЛИЗАЦИЯ ==========
-bot = Bot(token=BOT_TOKEN)
-storage = MemoryStorage()
-dp = Dispatcher(storage=storage)
-router = Router()
-dp.include_router(router)
+# МОЩНЫЙ ПРОМПТ для длинных текстов
+WRITER_PROMPT = """Ты — профессиональный писатель-романист с 20-летним опытом.
 
-# Инициализация клиента Groq (через OpenAI совместимый API)
-groq_client = OpenAI(
-    base_url="https://api.groq.com/openai/v1",
-    api_key=GROQ_API_KEY,
-)
+ТВОИ ОСНОВНЫЕ ЗАДАЧИ:
+1. Пиши ОЧЕНЬ ДЛИННО — каждая глава минимум 5000-8000 слов
+2. Используй максимальную детализацию: описание эмоций, мыслей, чувств, атмосферы
+3. Структура главы:
+   - Вступление (установка сцены, 1000+ слов)
+   - Развитие (диалоги, конфликты, 3000+ слов)
+   - Кульминация (эмоциональный пик, 2000+ слов)
+   - Развязка (подготовка к следующей главе, 1000+ слов)
+4. Стиль: кинематографичный, эмоциональный, immersive
+5. Температура: 0.95 (будь максимально креативным)
 
-# ========== ХРАНИЛИЩЕ ДАННЫХ ==========
-# Структура для хранения контекста пользователей
-class UserStory:
-    def __init__(self):
-        self.theme: str = ""
-        self.characters: str = ""
-        self.total_chapters: int = 0
-        self.current_chapter: int = 0
-        self.messages: List[Dict] = []
-        self.created_at: datetime = datetime.now()
+ЗАПРЕЩЕНО:
+- Сокращать текст
+- Пропускать детали
+- Заканчивать раньше чем через 5000 слов
+- Использовать шаблонные фразы"""
 
-user_stories: Dict[int, UserStory] = defaultdict(UserStory)
+@bot.message_handler(commands=['start', 'help'])
+def send_welcome(message):
+    help_text = """
+📚 *ГИГАНТСКИЙ ФАНФИК-БОТ* (Gemini Pro)
 
-# ========== FSM (Finite State Machine) СОСТОЯНИЯ ==========
-class StoryStates(StatesGroup):
-    waiting_theme = State()
-    waiting_characters = State()
-    waiting_chapters = State()
+*Я пишу ОЧЕНЬ длинные тексты (5000-8000+ слов на главу)*
 
-# ========== СИСТЕМНЫЙ ПРОМПТ ==========
-SYSTEM_PROMPT = """Ты — талантливый профессиональный писатель с многолетним опытом. Твоя задача — писать ОЧЕНЬ длинные, детальные и художественные фанфики.
+*Команды:*
+/start - приветствие
+/new - новая история (сброс)
+/status - статус истории
+/html - получить последнюю главу в HTML
+/help - справка
 
-ТВОИ ПРАВИЛА НАПИСАНИЯ:
-1. ДЛИНА: Каждая глава должна быть НЕ МЕНЕЕ 1500 слов. Пиши максимально подробно!
-2. ДЕТАЛИ: Используй богатые описания: чувства персонажей, атмосфера, запахи, звуки, текстуры, внутренние монологи.
-3. ДИАЛОГИ: Включай реалистичные диалоги, которые раскрывают персонажей.
-4. СТРУКТУРА: Каждая глава должна иметь: завязку, развитие, кульминацию и интригующий финал.
-5. СТИЛЬ: Избегай клише, будь оригинальным. Используй литературные приемы: метафоры, сравнения, символизм.
-6. ЭМОЦИИ: Передавай эмоции через действия и мысли, а не просто называй их.
+*Как писать:*
+1. "Напиши фанфик про [тема]" - начать
+2. Бот спросит количество глав (1-20)
+3. "глава 1" - начать первую главу
+4. "дальше" или "глава 2" - продолжить
 
-ТЕХНИЧЕСКИЕ ТРЕБОВАНИЯ:
-- Формат: художественная проза
-- Язык: современный русский литературный
-- Тон: соответствующий жанру
-- В каждой главе развивай сюжет и персонажей"""
+*Пример:* "Напиши фанфик про вампиров в космической академии"
 
-# ========== ВЕБ-СЕРВЕР ДЛЯ PING ==========
-async def handle_healthcheck(request):
-    """Обработчик для проверки работоспособности"""
-    return web.Response(text="Bot is alive! Users: {}".format(len(user_stories)))
-
-async def start_web_server():
-    """Запуск веб-сервера на aiohttp"""
-    app = web.Application()
-    app.router.add_get('/', handle_healthcheck)
-    app.router.add_get('/health', handle_healthcheck)
-    
-    # Получаем порт из переменной окружения (для Render)
-    port = int(os.environ.get("PORT", 8080))
-    
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, '0.0.0.0', port)
-    await site.start()
-    
-    logger.info(f"Web server started on port {port}")
-    return runner
-
-# ========== КОМАНДЫ БОТА ==========
-@router.message(CommandStart())
-async def cmd_start(message: Message):
-    """Команда /start - приветствие"""
-    welcome_text = """
-📚 *Добро пожаловать в Фанфик-Писатель 2.0!* 📚
-
-Я — профессиональный автор, который поможет тебе создать эпичную историю!
-
-*Как работать со мной:*
-
-1️⃣ *Начать новую историю:*
-   Напиши "напиши фанфик" или /new
-
-2️⃣ *Процесс создания:*
-   • Я спрошу тему (о чем история)
-   • Персонажей (кто главные герои)
-   • Количество глав
-
-3️⃣ *Генерация:*
-   • Я пишу ОЧЕНЬ длинные главы (1500+ слов)
-   • Каждую главу присылаю отдельным файлом
-   • После главы — кнопка для продолжения
-
-4️⃣ *Команды:*
-   /start - это сообщение
-   /new - начать новую историю
-   /reset - забыть текущую историю
-   /status - узнать прогресс
-   /continue - продолжить последнюю историю
-
-*Пример:* напиши "напиши фанфик" и следуй инструкциям!
-    """
-    
-    await message.answer(welcome_text, parse_mode="Markdown")
-    logger.info(f"User {message.from_user.id} started the bot")
-
-@router.message(Command("reset"))
-async def cmd_reset(message: Message, state: FSMContext):
-    """Команда /reset - сброс контекста"""
-    user_id = message.from_user.id
-    
-    # Очищаем историю пользователя
-    if user_id in user_stories:
-        del user_stories[user_id]
-    
-    # Сбрасываем состояние FSM
-    await state.clear()
-    
-    await message.answer("✅ Контекст полностью очищен! Я забыл все о предыдущей истории.")
-    logger.info(f"User {message.from_user.id} reset their story")
-
-@router.message(Command("new"))
-async def cmd_new(message: Message, state: FSMContext):
-    """Команда /new - начать новую историю"""
-    await state.set_state(StoryStates.waiting_theme)
-    await message.answer(
-        "🎬 Отлично! Начинаем новую историю!\n\n"
-        "*Шаг 1 из 3:* Опиши тему фанфика.\n"
-        "Например: 'романтика между вампиром и ведьмой в современном городе' или "
-        "'детектив в школе магии, где ученики исчезают'",
-        parse_mode="Markdown"
-    )
-    logger.info(f"User {message.from_user.id} started new story")
-
-@router.message(Command("status"))
-async def cmd_status(message: Message):
-    """Команда /status - статус текущей истории"""
-    user_id = message.from_user.id
-    story = user_stories.get(user_id)
-    
-    if not story or story.current_chapter == 0:
-        await message.answer("📭 У тебя нет активной истории. Начни новую через /new")
-        return
-    
-    status_text = f"""
-📖 *Текущая история:*
-
-*Тема:* {story.theme[:100]}...
-*Персонажи:* {story.characters[:100]}...
-*Прогресс:* Глава {story.current_chapter} из {story.total_chapters}
-*Начата:* {story.created_at.strftime('%d.%m.%Y %H:%M')}
-
-Для продолжения нажми кнопку "Следующая глава" или напиши "дальше".
+Каждая глава приходит в 2 форматах: .txt и .html с красивым форматированием!
 """
-    await message.answer(status_text, parse_mode="Markdown")
+    bot.send_message(message.chat.id, help_text, parse_mode='Markdown')
 
-@router.message(F.text.lower().contains("напиши фанфик"))
-async def start_story_creation(message: Message, state: FSMContext):
-    """Обработчик фразы 'напиши фанфик'"""
-    await cmd_new(message, state)
+@bot.message_handler(commands=['new'])
+def new_story(message):
+    user_id = message.chat.id
+    user_contexts[user_id] = {
+        'story_title': None,
+        'current_chapter': 0,
+        'total_chapters': 0,
+        'plot_summary': '',
+        'characters': [],
+        'history': [],
+        'all_text': ''
+    }
+    bot.send_message(message.chat.id, "✨ Новая история создана! Опиши идею.")
 
-# ========== FSM ОБРАБОТЧИКИ ==========
-@router.message(StoryStates.waiting_theme)
-async def process_theme(message: Message, state: FSMContext):
-    """Обработка темы истории"""
-    user_id = message.from_user.id
-    
-    # Сохраняем тему
-    user_stories[user_id].theme = message.text
-    
-    # Переходим к следующему шагу
-    await state.set_state(StoryStates.waiting_characters)
-    await message.answer(
-        "✅ Тема сохранена!\n\n"
-        "*Шаг 2 из 3:* Опиши главных персонажей.\n"
-        "Например: 'Лина — юная ведьма с тайной силой, Маркус — вампир-одиночка с темным прошлым'",
-        parse_mode="Markdown"
-    )
-    logger.info(f"User {user_id} set theme: {message.text[:50]}")
-
-@router.message(StoryStates.waiting_characters)
-async def process_characters(message: Message, state: FSMContext):
-    """Обработка персонажей"""
-    user_id = message.from_user.id
-    
-    # Сохраняем персонажей
-    user_stories[user_id].characters = message.text
-    
-    # Переходим к выбору количества глав
-    await state.set_state(StoryStates.waiting_chapters)
-    
-    # Создаем клавиатуру для выбора количества глав
-    builder = InlineKeyboardBuilder()
-    chapters_options = [1, 3, 5, 7, 10, 15]
-    for num in chapters_options:
-        builder.button(text=f"{num} глав", callback_data=f"chapters_{num}")
-    builder.adjust(3, 2)  # 3 кнопки в первом ряду, 2 во втором
-    
-    await message.answer(
-        "✅ Персонажи сохранены!\n\n"
-        "*Шаг 3 из 3:* Сколько глав будет в истории?\n"
-        "Выбери количество или напиши свою цифру (от 1 до 20):",
-        parse_mode="Markdown",
-        reply_markup=builder.as_markup()
-    )
-    logger.info(f"User {user_id} set characters: {message.text[:50]}")
-
-@router.message(StoryStates.waiting_chapters)
-async def process_chapters_text(message: Message, state: FSMContext):
-    """Обработка текстового ввода количества глав"""
-    user_id = message.from_user.id
-    
-    try:
-        chapters = int(message.text)
-        if 1 <= chapters <= 20:
-            await save_chapters(user_id, chapters, message, state)
-        else:
-            await message.answer("Пожалуйста, введите число от 1 до 20")
-    except ValueError:
-        await message.answer("Пожалуйста, введите число (например: 5)")
-
-@router.callback_query(F.data.startswith("chapters_"))
-async def process_chapters_callback(callback: CallbackQuery, state: FSMContext):
-    """Обработка выбора количества глав через кнопки"""
-    user_id = callback.from_user.id
-    
-    chapters = int(callback.data.split("_")[1])
-    await save_chapters(user_id, chapters, callback.message, state)
-    await callback.answer()
-
-async def save_chapters(user_id: int, chapters: int, message: Message, state: FSMContext):
-    """Сохранение количества глав и запуск первой главы"""
-    story = user_stories[user_id]
-    story.total_chapters = chapters
-    story.current_chapter = 0
-    
-    # Сбрасываем состояние FSM
-    await state.clear()
-    
-    # Отправляем подтверждение
-    confirmation = f"""
-🎉 Отлично! Начинаем писать историю!
-
-*Тема:* {story.theme}
-*Персонажи:* {story.characters}
-*Глав:* {story.total_chapters}
-
-Сейчас напишу первую главу. Это займет 30-60 секунд...
-    """
-    
-    await message.answer(confirmation, parse_mode="Markdown")
-    logger.info(f"User {user_id} set {chapters} chapters")
-    
-    # Запускаем написание первой главы
-    await write_chapter(user_id, message.chat.id)
-
-# ========== ГЕНЕРАЦИЯ ГЛАВ ==========
-async def write_chapter(user_id: int, chat_id: int):
-    """Генерация одной главы через Groq API"""
-    story = user_stories[user_id]
-    story.current_chapter += 1
-    
-    # Статус сообщение
-    status_msg = await bot.send_message(
-        chat_id,
-        f"✍️ Пишу главу {story.current_chapter}/{story.total_chapters}...\n"
-        f"⏱️ Это займет 30-60 секунд",
-    )
-    
-    # Формируем промпт для главы
-    chapter_prompt = f"""
-ТЕМА ИСТОРИИ: {story.theme}
-ПЕРСОНАЖИ: {story.characters}
-
-ЗАДАНИЕ: Напиши ГЛАВУ {story.current_chapter} из {story.total_chapters}.
-
-ОСОБЫЕ УКАЗАНИЯ:
-1. Эта глава должна быть САМОСТОЯТЕЛЬНОЙ, но при этом продолжать общий сюжет
-2. Длина: НЕ МЕНЕЕ 1500 СЛОВ
-3. Если это не первая глава, плавно продолжай с того места, где остановились
-4. В конце главы создай интригу для следующей главы
-5. Используй художественный, литературный стиль
-"""
-    
-    # Если это не первая глава, добавляем контекст
-    if story.current_chapter > 1 and story.messages:
-        chapter_prompt += f"\nПРЕДЫДУЩИЙ КОНТЕКСТ: [продолжи историю с учетом предыдущих событий]"
-    
-    try:
-        # Подготовка сообщений для API
-        messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
-        ]
+@bot.message_handler(commands=['status'])
+def check_status(message):
+    user_id = message.chat.id
+    if user_id in user_contexts:
+        ctx = user_contexts[user_id]
+        total_words = len(ctx.get('all_text', '').split())
         
-        # Добавляем историю сообщений (последние 3 обмена)
-        for msg in story.messages[-6:]:  # Берем последние 3 пары вопрос-ответ
-            messages.append(msg)
-        
-        # Добавляем текущий запрос
-        messages.append({"role": "user", "content": chapter_prompt})
-        
-        # Вызов Groq API
-        logger.info(f"Calling Groq API for user {user_id}, chapter {story.current_chapter}")
-        
-        response = await asyncio.to_thread(
-            groq_client.chat.completions.create,
-            model=GROQ_MODEL,
-            messages=messages,
-            temperature=0.85,
-            max_tokens=4000,  # Максимум для длинных текстов
-            top_p=0.9,
+        status = f"""
+📖 *Статус истории:*
+├ Название: {ctx['story_title'] or 'Ещё не задано'}
+├ Прогресс: {ctx['current_chapter']}/{ctx['total_chapters']} глав
+├ Всего слов: {total_words}
+├ Персонажи: {', '.join(ctx['characters'][:3]) if ctx['characters'] else '...'}
+└ Тема: {ctx['plot_summary'][:80]}...
+        """
+        bot.send_message(message.chat.id, status, parse_mode='Markdown')
+    else:
+        bot.send_message(message.chat.id, "📭 Нет активной истории. /new - начать")
+
+@bot.message_handler(commands=['html'])
+def send_last_html(message):
+    user_id = message.chat.id
+    if user_id in user_contexts and user_contexts[user_id]['history']:
+        last_chapter = user_contexts[user_id]['history'][-1]
+        html_content = create_html_chapter(
+            last_chapter['response'],
+            user_contexts[user_id],
+            last_chapter['chapter']
         )
         
-        # Получаем текст главы
-        chapter_text = response.choices[0].message.content
-        
-        # Сохраняем в историю
-        story.messages.append({"role": "user", "content": chapter_prompt})
-        story.messages.append({"role": "assistant", "content": chapter_text})
-        
-        # Ограничиваем историю (чтобы не переполнять контекст)
-        if len(story.messages) > 20:
-            story.messages = story.messages[-20:]
-        
-        # Создаем HTML файл с главой
-        html_content = create_html_chapter(story, chapter_text)
-        
-        # Отправляем файл пользователю
-        await send_chapter_as_file(chat_id, story, chapter_text, html_content)
-        
-        # Удаляем статус сообщение
-        await bot.delete_message(chat_id, status_msg.message_id)
-        
-        logger.info(f"Chapter {story.current_chapter} completed for user {user_id}")
-        
-        # Показываем кнопку для следующей главы (если есть еще главы)
-        if story.current_chapter < story.total_chapters:
-            await show_next_chapter_button(chat_id, story)
-        else:
-            await bot.send_message(
-                chat_id,
-                f"🎉 *История завершена!*\n\n"
-                f"Написано {story.total_chapters} глав.\n"
-                f"Чтобы начать новую историю, напиши /new",
-                parse_mode="Markdown"
-            )
-    
-    except Exception as e:
-        logger.error(f"Error generating chapter for user {user_id}: {e}")
-        error_msg = f"❌ Ошибка при генерации главы: {str(e)}"
-        
-        # Проверяем специфичные ошибки Groq
-        if "429" in str(e):
-            error_msg = "🔄 Слишком много запросов. Подожди 1 минуту и попробуй снова."
-        elif "403" in str(e):
-            error_msg = "🔑 Проблема с API ключом. Проверь настройки."
-        elif "timeout" in str(e).lower():
-            error_msg = "⏱️ Таймаут запроса. Попробуй еще раз."
-        
-        await bot.edit_message_text(
-            error_msg,
-            chat_id,
-            status_msg.message_id
-        )
+        with io.BytesIO(html_content.encode('utf-8')) as f:
+            f.name = f"Глава_{last_chapter['chapter']}.html"
+            bot.send_document(user_id, f, caption="📄 HTML-версия последней главы")
+    else:
+        bot.send_message(user_id, "Нет написанных глав")
 
-def create_html_chapter(story: UserStory, chapter_text: str) -> str:
-    """Создает HTML файл с главой"""
-    html = f"""<!DOCTYPE html>
+def initialize_user(user_id):
+    if user_id not in user_contexts:
+        user_contexts[user_id] = {
+            'story_title': None,
+            'current_chapter': 0,
+            'total_chapters': 0,
+            'plot_summary': '',
+            'characters': [],
+            'history': [],
+            'all_text': ''
+        }
+    return user_contexts[user_id]
+
+def create_html_chapter(text, ctx, chapter_num):
+    """Создает красивый HTML из главы"""
+    # Экранируем HTML символы
+    safe_text = html.escape(text)
+    
+    # Разбиваем на абзацы
+    paragraphs = safe_text.split('\n\n')
+    formatted_paragraphs = []
+    
+    for para in paragraphs:
+        if para.strip():
+            # Выделяем диалоги (строки в кавычках)
+            if ('"' in para or '—' in para or '«' in para) and len(para) < 200:
+                formatted_paragraphs.append(f'<p class="dialogue">{para}</p>')
+            else:
+                formatted_paragraphs.append(f'<p>{para}</p>')
+    
+    html_content = f"""<!DOCTYPE html>
 <html lang="ru">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Глава {story.current_chapter} - {story.theme[:50]}</title>
+    <title>Глава {chapter_num}: {ctx['story_title']}</title>
     <style>
         body {{
             font-family: 'Georgia', serif;
             line-height: 1.8;
             max-width: 800px;
             margin: 0 auto;
-            padding: 40px 20px;
-            background: #fefefe;
+            padding: 40px;
+            background: #f5f5f0;
             color: #333;
         }}
         .header {{
             text-align: center;
-            border-bottom: 2px solid #e0e0e0;
+            border-bottom: 3px double #8b4513;
             padding-bottom: 20px;
             margin-bottom: 40px;
         }}
         .chapter-title {{
             font-size: 2.5em;
-            color: #2c3e50;
-            margin-bottom: 10px;
+            color: #8b4513;
+            font-variant: small-caps;
+            letter-spacing: 2px;
         }}
-        .chapter-number {{
+        .story-title {{
             font-size: 1.2em;
-            color: #7f8c8d;
+            color: #666;
             font-style: italic;
         }}
-        .meta {{
-            background: #f8f9fa;
-            padding: 15px;
-            border-radius: 5px;
-            margin: 20px 0;
-            font-size: 0.9em;
-        }}
-        .content {{
-            font-size: 1.1em;
+        p {{
             text-align: justify;
-            white-space: pre-line;
+            margin: 1.5em 0;
+            text-indent: 2em;
+            font-size: 1.1em;
         }}
-        .content p {{
-            margin-bottom: 1.5em;
-            text-indent: 1.5em;
+        .dialogue {{
+            margin-left: 4em;
+            font-style: italic;
+            color: #2f4f4f;
+            text-indent: 0;
         }}
-        .footer {{
-            margin-top: 50px;
-            padding-top: 20px;
-            border-top: 1px solid #e0e0e0;
-            text-align: center;
+        .first-letter::first-letter {{
+            font-size: 3em;
+            float: left;
+            line-height: 1;
+            margin-right: 10px;
+            color: #8b4513;
+            font-weight: bold;
+        }}
+        .word-count {{
+            text-align: right;
             font-size: 0.9em;
-            color: #7f8c8d;
+            color: #888;
+            margin-top: 40px;
+            border-top: 1px solid #ddd;
+            padding-top: 10px;
         }}
     </style>
 </head>
 <body>
     <div class="header">
-        <h1 class="chapter-title">Глава {story.current_chapter}</h1>
-        <div class="chapter-number">{story.current_chapter} из {story.total_chapters}</div>
-    </div>
-    
-    <div class="meta">
-        <strong>Тема:</strong> {story.theme}<br>
-        <strong>Персонажи:</strong> {story.characters}<br>
-        <strong>Сгенерировано:</strong> {datetime.now().strftime('%d.%m.%Y %H:%M')}<br>
-        <strong>Слов:</strong> {len(chapter_text.split())}
+        <div class="chapter-title">Глава {chapter_num}</div>
+        <div class="story-title">{html.escape(ctx['story_title'] or 'Фанфик')}</div>
     </div>
     
     <div class="content">
-        {chapter_text}
+        <p class="first-letter">{formatted_paragraphs[0] if formatted_paragraphs else ''}</p>
+        {"".join(formatted_paragraphs[1:])}
     </div>
     
-    <div class="footer">
-        Создано с помощью Фанфик-Писатель Bot • {datetime.now().year}
+    <div class="word-count">
+        Слов: {len(text.split())} | Символов: {len(text)}
     </div>
 </body>
 </html>"""
-    return html
+    
+    return html_content
 
-async def send_chapter_as_file(chat_id: int, story: UserStory, chapter_text: str, html_content: str):
-    """Отправляет главу как текстовый и HTML файл"""
+def generate_long_chapter(prompt, history, chapter_num, total_chapters):
+    """Генерирует ОЧЕНЬ длинную главу через Gemini"""
     
-    # Отправляем сначала текстовую версию (для быстрого чтения)
-    await bot.send_message(
-        chat_id,
-        f"📖 *Глава {story.current_chapter} из {story.total_chapters}*\n\n"
-        f"{chapter_text[:500]}...\n\n"
-        f"📊 *Статистика:* {len(chapter_text.split())} слов",
-        parse_mode="Markdown"
-    )
-    
-    # Создаем и отправляем HTML файл
-    html_bytes = html_content.encode('utf-8')
-    html_file = io.BytesIO(html_bytes)
-    html_file.name = f"Глава_{story.current_chapter}_{story.theme[:30]}.html"
-    
-    await bot.send_document(
-        chat_id,
-        document=FSInputFile(html_file, filename=html_file.name),
-        caption=f"📄 HTML-версия главы {story.current_chapter}"
-    )
-    
-    # Также отправляем текстовый файл
-    text_file = io.BytesIO(chapter_text.encode('utf-8'))
-    text_file.name = f"Глава_{story.current_chapter}_текст.txt"
-    
-    await bot.send_document(
-        chat_id,
-        document=FSInputFile(text_file, filename=text_file.name),
-        caption=f"📝 Текстовая версия главы {story.current_chapter}"
-    )
+    # Строим системный промпт с историей
+    system_prompt = f"""{WRITER_PROMPT}
 
-async def show_next_chapter_button(chat_id: int, story: UserStory):
-    """Показывает кнопку для следующей главы"""
-    builder = InlineKeyboardBuilder()
-    builder.button(
-        text=f"Написать главу {story.current_chapter + 1}",
-        callback_data="next_chapter"
-    )
-    builder.button(
-        text="Продолжить позже",
-        callback_data="later"
-    )
-    builder.adjust(1)
-    
-    await bot.send_message(
-        chat_id,
-        f"✅ *Глава {story.current_chapter} готова!*\n\n"
-        f"Осталось глав: {story.total_chapters - story.current_chapter}\n\n"
-        f"Хочешь продолжить сейчас или позже?",
-        parse_mode="Markdown",
-        reply_markup=builder.as_markup()
-    )
+КОНТЕКСТ ИСТОРИИ:
+Тема: {history.get('plot_summary', 'не задано')}
+Персонажи: {', '.join(history.get('characters', []))}
+Глава {chapter_num} из {total_chapters}
 
-@router.callback_query(F.data == "next_chapter")
-async def next_chapter_handler(callback: CallbackQuery):
-    """Обработчик кнопки 'Следующая глава'"""
-    user_id = callback.from_user.id
-    
-    if user_id not in user_stories:
-        await callback.answer("Начни новую историю через /new")
-        return
-    
-    story = user_stories[user_id]
-    
-    if story.current_chapter >= story.total_chapters:
-        await callback.answer("История уже завершена! Начни новую через /new")
-        return
-    
-    await callback.answer("Начинаю писать следующую главу...")
-    await callback.message.delete()  # Удаляем кнопку
-    
-    # Запускаем написание следующей главы
-    await write_chapter(user_id, callback.message.chat.id)
+ПРЕДЫДУЩИЙ КОНТЕКСТ (последние 2 главы):
+{history.get('last_chapters_preview', '')}
 
-@router.callback_query(F.data == "later")
-async def later_handler(callback: CallbackQuery):
-    """Обработчик кнопки 'Продолжить позже'"""
-    await callback.answer("Окей, продолжим позже! Напиши 'дальше' когда будешь готов.")
-    await callback.message.delete()
+ТВОЯ ЗАДАЧА:
+Напиши главу {chapter_num}. Она должна быть САМОЙ ДЛИННОЙ из возможных.
+Минимум 5000 слов, в идеале 8000+ слов.
+Используй максимальную детализацию каждого момента.
 
-@router.message(F.text.lower().in_(["дальше", "следующая глава", "продолжить"]))
-async def continue_story_handler(message: Message):
-    """Обработчик текстовых команд для продолжения"""
-    user_id = message.from_user.id
-    
-    if user_id not in user_stories:
-        await message.answer("Начни новую историю через /new")
-        return
-    
-    story = user_stories[user_id]
-    
-    if story.current_chapter >= story.total_chapters:
-        await message.answer("История уже завершена! Начни новую через /new")
-        return
-    
-    if story.current_chapter == 0:
-        await message.answer("Сначала начни историю через /new")
-        return
-    
-    # Запускаем написание следующей главы
-    await write_chapter(user_id, message.chat.id)
+ПРОМПТ ПОЛЬЗОВАТЕЛЯ: {prompt}
 
-# ========== ОБРАБОТКА ОШИБОК ==========
-@router.message()
-async def handle_other_messages(message: Message):
-    """Обработчик всех остальных сообщений"""
-    if message.text:
-        await message.answer(
-            "Я специализируюсь на написании фанфиков! 🖋️\n\n"
-            "Чтобы начать, напиши:\n"
-            "• 'напиши фанфик'\n"
-            "• или используй команду /new\n\n"
-            "Другие команды:\n"
-            "/start - справка\n"
-            "/reset - сбросить историю\n"
-            "/status - прогресс"
-        )
-
-# ========== ЗАПУСК БОТА ==========
-async def main():
-    """Основная функция запуска"""
-    logger.info("Starting bot...")
-    
-    # Запускаем веб-сервер в фоне
-    web_runner = await start_web_server()
+НАЧИНАЙ ПИСАТЬ СЕЙЧАС:"""
     
     try:
-        # Запускаем бота
-        await dp.start_polling(bot)
-    finally:
-        # Очищаем ресурсы
-        await bot.session.close()
-        await web_runner.cleanup()
+        # Первый запрос - основа главы
+        response = model.generate_content(
+            system_prompt,
+            generation_config=genai.GenerationConfig(
+                temperature=0.95,
+                top_p=0.95,
+                top_k=50,
+                max_output_tokens=4000  # Максимум для Gemini
+            )
+        )
+        
+        chapter_text = response.text
+        
+        # Если текст короткий, делаем дополнительный запрос для продолжения
+        if len(chapter_text.split()) < 3000:
+            continuation_prompt = f"""
+ПРОДОЛЖИ ЭТУ ГЛАВУ. Ты написал только {len(chapter_text.split())} слов, а нужно минимум 5000.
+
+Текст пока:
+{chapter_text[:2000]}...
+
+ДОПИШИ ОЧЕНЬ ПОДРОБНО:
+1. Добавь диалоги между персонажами (минимум 3 длинных диалога)
+2. Опиши детально окружение: запахи, звуки, текстуры, свет
+3. Добавь внутренние монологи персонажей
+4. Создай дополнительный конфликт или поворот сюжета
+5. Растяни каждую сцену в 2-3 раза подробнее
+
+ПРОДОЛЖЕНИЕ:"""
+            
+            continuation = model.generate_content(continuation_prompt)
+            chapter_text += "\n\n" + continuation.text
+        
+        return chapter_text
+        
+    except Exception as e:
+        return f"Ошибка генерации: {str(e)}\n\nПопробуй еще раз или измени промпт."
+
+@bot.message_handler(func=lambda m: True)
+def handle_message(message):
+    user_id = message.chat.id
+    text = message.text.strip()
+    
+    if 'напиши фанфик' in text.lower() or 'хочу фанфик' in text.lower():
+        theme = text.replace('напиши фанфик', '').replace('хочу фанфик', '').strip()
+        if not theme:
+            bot.send_message(user_id, "📝 О какой теме фанфик? Например: 'про вампиров в школе'")
+            return
+        
+        ctx = initialize_user(user_id)
+        ctx['plot_summary'] = theme
+        ctx['story_title'] = f"Фанфик: {theme[:30]}..."
+        
+        markup = telebot.types.ReplyKeyboardMarkup(row_width=4, resize_keyboard=True)
+        buttons = ['1', '3', '5', '7', '10', '15', '20']
+        for btn in buttons:
+            markup.add(btn)
+        
+        msg = bot.send_message(
+            user_id,
+            f"🎬 Тема: '{theme}'\nСколько глав будет? (1-20)\n\nЧем больше глав — тем эпичнее сага!",
+            reply_markup=markup
+        )
+        bot.register_next_step_handler(msg, ask_chapters)
+    
+    elif 'глава' in text.lower() or 'дальше' in text.lower() or 'следующ' in text.lower():
+        ctx = initialize_user(user_id)
+        
+        if ctx['total_chapters'] == 0:
+            bot.send_message(user_id, "Сначала задай количество глав. Напиши 'напиши фанфик про...'")
+            return
+        
+        # Определяем номер главы
+        chapter_num = 1
+        if 'глава' in text.lower():
+            words = text.lower().split()
+            for word in words:
+                if word.isdigit():
+                    chapter_num = int(word)
+                    break
+            else:
+                chapter_num = ctx['current_chapter'] + 1
+        else:
+            chapter_num = ctx['current_chapter'] + 1
+        
+        if chapter_num > ctx['total_chapters']:
+            bot.send_message(user_id, f"🎉 История завершена! Написано {ctx['total_chapters']} глав.\n/new - новая история")
+            return
+        
+        if chapter_num <= ctx['current_chapter']:
+            bot.send_message(user_id, f"Эта глава уже написана. Следующая: {ctx['current_chapter'] + 1}")
+            return
+        
+        # ПИШЕМ ГЛАВУ
+        ctx['current_chapter'] = chapter_num
+        write_chapter(message, chapter_num)
+    
+    else:
+        bot.send_message(user_id, "📝 Чтобы начать: 'Напиши фанфик про [тема]'\n\nИли команды:\n/new - новая история\n/status - статус\n/html - получить HTML")
+
+def ask_chapters(message):
+    user_id = message.chat.id
+    try:
+        chapters = int(message.text)
+        if 1 <= chapters <= 20:
+            ctx = user_contexts[user_id]
+            ctx['total_chapters'] = chapters
+            
+            remove_markup = telebot.types.ReplyKeyboardRemove()
+            bot.send_message(
+                user_id,
+                f"🔥 Отлично! Будет {chapters} глав!\n\nКаждая глава будет ОЧЕНЬ длинной (5000-8000+ слов).\n\nНапиши 'глава 1' чтобы начать эпическую сагу!",
+                reply_markup=remove_markup
+            )
+        else:
+            bot.send_message(user_id, "Укажи число от 1 до 20")
+    except:
+        bot.send_message(user_id, "Напиши цифрой: 1, 3, 5, 7, 10...")
+
+def write_chapter(message, chapter_num):
+    user_id = message.chat.id
+    ctx = user_contexts[user_id]
+    
+    # Статус
+    status_msg = bot.send_message(
+        user_id,
+        f"✍️ *Пишу ГЛАВУ {chapter_num}/{ctx['total_chapters']}*\n\n"
+        f"⏳ Это займет 30-60 секунд\n"
+        f"📝 Цель: 5000-8000+ слов\n"
+        f"🎯 Тема: {ctx['plot_summary'][:50]}...",
+        parse_mode='Markdown'
+    )
+    
+    # Готовим промпт
+    prompt = f"Напиши подробнейшую главу {chapter_num} на тему: {ctx['plot_summary']}"
+    
+    # Добавляем контекст предыдущих глав
+    if ctx['history']:
+        last_chapters = ctx['history'][-2:]  # Последние 2 главы
+        context_preview = "\n\n".join([
+            f"Глава {h['chapter']} (фрагмент): {h['response'][:500]}..." 
+            for h in last_chapters
+        ])
+        ctx['last_chapters_preview'] = context_preview
+    
+    # Генерация
+    try:
+        chapter_text = generate_long_chapter(prompt, ctx, chapter_num, ctx['total_chapters'])
+        
+        # Сохраняем
+        ctx['history'].append({
+            'request': prompt,
+            'response': chapter_text,
+            'chapter': chapter_num,
+            'timestamp': datetime.now().isoformat(),
+            'word_count': len(chapter_text.split())
+        })
+        
+        ctx['all_text'] += "\n\n" + chapter_text
+        
+        # Отправляем TXT
+        word_count = len(chapter_text.split())
+        with io.BytesIO(chapter_text.encode('utf-8')) as txt_file:
+            txt_file.name = f"Глава_{chapter_num}_{ctx['story_title'].replace(' ', '_')}.txt"
+            caption_txt = f"📖 *Глава {chapter_num}: {ctx['story_title']}*\n\n"
+            caption_txt += f"📊 Статистика:\n"
+            caption_txt += f"• Слов: {word_count}\n"
+            caption_txt += f"• Символов: {len(chapter_text)}\n"
+            caption_txt += f"• Глав: {chapter_num}/{ctx['total_chapters']}\n\n"
+            
+            if chapter_num < ctx['total_chapters']:
+                caption_txt += f"Для следующей главы напиши 'глава {chapter_num + 1}'"
+            else:
+                caption_txt += f"🎉 *ИСТОРИЯ ЗАВЕРШЕНА!*\n/new - начать новую"
+            
+            bot.send_document(user_id, txt_file, caption=caption_txt, parse_mode='Markdown')
+        
+        # Отправляем HTML
+        html_content = create_html_chapter(chapter_text, ctx, chapter_num)
+        with io.BytesIO(html_content.encode('utf-8')) as html_file:
+            html_file.name = f"Глава_{chapter_num}_Красивый.html"
+            bot.send_document(
+                user_id, 
+                html_file, 
+                caption=f"🎨 HTML-версия главы {chapter_num} (открой в браузере)"
+            )
+        
+        bot.delete_message(user_id, status_msg.message_id)
+        
+        # Автоматически добавляем персонажей из текста
+        if not ctx['characters'] and chapter_num == 1:
+            extract_characters(user_id, chapter_text)
+            
+    except Exception as e:
+        bot.edit_message_text(
+            f"❌ Ошибка при генерации:\n```{str(e)[:300]}```",
+            user_id,
+            status_msg.message_id,
+            parse_mode='Markdown'
+        )
+
+def extract_characters(user_id, text):
+    """Извлекает имена персонажей из текста"""
+    try:
+        prompt = f"Извлеки имена персонажей из текста, верни только через запятую:\n\n{text[:1000]}"
+        response = model.generate_content(prompt)
+        
+        if response.text:
+            characters = [c.strip() for c in response.text.split(',') if len(c.strip()) > 2]
+            if characters:
+                user_contexts[user_id]['characters'] = characters[:5]  # максимум 5 персонажей
+    except:
+        pass
+
+# Flask сервер для Render
+@app.route('/')
+def home():
+    return f"📚 Фанфик-бот (Gemini) работает! Пользователей: {len(user_contexts)}"
+
+@app.route('/ping')
+def ping():
+    return "pong"
+
+def run_flask():
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host='0.0.0.0', port=port)
 
 if __name__ == "__main__":
-    # Проверяем наличие обязательных переменных
-    if GROQ_API_KEY == "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":
-        logger.error("❌ Установи GROQ_API_KEY в коде!")
-        exit(1)
+    print("=== Запуск Gemini Фанфик-Бота ===")
+    print(f"API ключ: {'Установлен' if GEMINI_API_KEY and 'AIza' in GEMINI_API_KEY else 'ОШИБКА!'}")
     
-    if BOT_TOKEN == "8503199106:AAEZAWOq7hgC_2NBtgyckhbNl3K3qkbOKL4":
-        logger.error("❌ Установи BOT_TOKEN в коде!")
-        exit(1)
+    # Запускаем Flask в фоне
+    Thread(target=run_flask, daemon=True).start()
     
     # Запускаем бота
-    asyncio.run(main())
+    print("=== Бот запущен ===")
+    bot.infinity_polling()
