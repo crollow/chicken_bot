@@ -5,6 +5,7 @@ import threading
 import os
 import time
 from flask import Flask
+import re  # Добавлен импорт
 
 # --- КОНФИГУРАЦИЯ ---
 TOKEN = '8412845441:AAFUh9QiSOp0ivuWSBA6MHCw3lqHKwrd2uE'
@@ -61,7 +62,7 @@ def update_admin_cache():
     admins = cursor.execute('SELECT user_id FROM admins').fetchall()
     conn.close()
     ADMIN_CACHE = {admin[0] for admin in admins}
-    ADMIN_CACHE.add(OWNER_ID) # Владелец всегда админ
+    ADMIN_CACHE.add(OWNER_ID)  # Владелец всегда админ
 
 def add_user_to_db(user_id):
     conn = get_db_connection()
@@ -78,7 +79,7 @@ def main_menu():
 
 def admin_menu():
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
-    markup.add("➕ Добавить товар", "❌ Удалить товар") # "Удалить товар" можно добавить позже, если нужно
+    markup.add("➕ Добавить товар", "❌ Удалить товар")
     markup.add("📢 Рассылка", "📊 Статистика")
     markup.add("👤 Добавить админа", "🗑 Удалить админа")
     markup.add("🏠 В главное меню")
@@ -141,10 +142,11 @@ def forward_to_admins(message):
         try:
             bot.send_message(admin_id, 
                              f"📩 <b>Новое сообщение от поддержки!</b>\n"
-                             f"От: @{message.from_user.username} (ID: <code>{message.from_user.id}</code>)\n\n"
+                             f"От: @{message.from_user.username or 'нет username'} (ID: <code>{message.from_user.id}</code>)\n\n"
                              f"Текст: {message.text}", parse_mode="HTML")
-        except:
-            pass # Если админ заблокировал бота
+        except Exception as e:
+            print(f"Не удалось отправить сообщение админу {admin_id}: {e}")
+            pass  # Если админ заблокировал бота
             
     bot.send_message(message.chat.id, "✅ Сообщение отправлено! Ожидайте ответа.", reply_markup=main_menu())
 
@@ -170,7 +172,7 @@ def process_add_admin(message):
         else:
             cursor.execute('INSERT INTO admins (user_id) VALUES (?)', (new_admin_id,))
             conn.commit()
-            update_admin_cache() # Обновляем кэш
+            update_admin_cache()  # Обновляем кэш
             bot.send_message(message.chat.id, f"✅ Пользователь <code>{new_admin_id}</code> добавлен в админы.", parse_mode="HTML")
             
         conn.close()
@@ -184,6 +186,10 @@ def del_admin_step(message):
     admins = conn.cursor().execute('SELECT user_id FROM admins').fetchall()
     conn.close()
     
+    if not admins:
+        bot.send_message(message.chat.id, "⚠ Список админов пуст.")
+        return
+        
     text_list = "Список админов:\n" + "\n".join([f"<code>{a[0]}</code>" for a in admins])
     msg = bot.send_message(message.chat.id, f"{text_list}\n\n✍ Введите ID админа, которого нужно удалить:", parse_mode="HTML")
     bot.register_next_step_handler(msg, process_del_admin)
@@ -213,52 +219,102 @@ def process_del_admin(message):
 
 # --- АДМИН: ТОВАРЫ ---
 
-@bot.message_handler(func=lambda m: (m.text == "➕ Добавить ФИЗ" or m.text == "➕ Добавить товар") and m.from_user.id in ADMIN_CACHE)
+@bot.message_handler(func=lambda m: m.text == "➕ Добавить товар" and m.from_user.id in ADMIN_CACHE)
 def add_item_start(message):
     msg = bot.send_message(message.chat.id, "1️⃣ Введите страну (например: 🇰🇿 Казахстан):")
     bot.register_next_step_handler(msg, process_country)
 
 def process_country(message):
+    if message.text in ["🏠 В главное меню", "📦 Купить ФИЗ", "🆘 Связь с владельцем"]:
+        bot.send_message(message.chat.id, "❌ Отменено.", reply_markup=admin_menu())
+        return
+        
     country = message.text
-    markup = types.InlineKeyboardMarkup()
-    markup.add(types.InlineKeyboardButton("Дни", callback_data=f"type_дн_{country}"),
-               types.InlineKeyboardButton("Года", callback_data=f"type_г_{country}"))
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        types.InlineKeyboardButton("Дни", callback_data=f"type_дн_{country.replace(' ', '_')}"),
+        types.InlineKeyboardButton("Года", callback_data=f"type_г_{country.replace(' ', '_')}")
+    )
     bot.send_message(message.chat.id, "2️⃣ Выберите тип отлеги:", reply_markup=markup)
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('type_'))
 def process_type_callback(call):
     bot.answer_callback_query(call.id)
     data = call.data.split('_')
-    # Формат: type_тип_страна
-    # Если страна из нескольких слов, split может разбить неправильно, поэтому используем срез
+    
+    if len(data) < 3:
+        bot.send_message(call.message.chat.id, "❌ Ошибка в данных.")
+        return
+        
     o_type = data[1]
-    country = "_".join(data[2:]) # Собираем страну обратно, если она была с пробелами (хотя в callback лучше избегать пробелов)
-    
-    # Чтобы избежать ошибок с пробелами, берем страну из текста кнопки нельзя, 
-    # лучше передавать через словарь состояний, но для простоты оставим так (или возьмем из previous step в памяти).
-    # Упростим: берем страну из msg, но так как это callback... 
-    # В данном коде, лучше сохранить страну в аргументы.
-    
-    # Исправленный подход:
-    country = call.data[len(f"type_{o_type}_"):] # Берем весь хвост строки
+    # Восстанавливаем страну из callback_data (заменяем _ на пробелы)
+    country = " ".join(data[2:]).replace('_', ' ')
     
     msg = bot.send_message(call.message.chat.id, f"3️⃣ Введите количество ({o_type}):")
     bot.register_next_step_handler(msg, lambda m: process_otlega_val(m, country, o_type))
 
 def process_otlega_val(message, country, o_type):
+    if message.text in ["🏠 В главное меню", "📦 Купить ФИЗ", "🆘 Связь с владельцем"]:
+        bot.send_message(message.chat.id, "❌ Отменено.", reply_markup=admin_menu())
+        return
+        
     otlega_val = message.text
     full_otlega = f"{otlega_val} {o_type}"
     msg = bot.send_message(message.chat.id, "4️⃣ Введите цену (например: 500₽):")
     bot.register_next_step_handler(msg, lambda m: finish_item_add(m, country, full_otlega))
 
 def finish_item_add(message, country, full_otlega):
+    if message.text in ["🏠 В главное меню", "📦 Купить ФИЗ", "🆘 Связь с владельцем"]:
+        bot.send_message(message.chat.id, "❌ Отменено.", reply_markup=admin_menu())
+        return
+        
     price = message.text
     conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute('INSERT INTO accounts (country, otlega, price) VALUES (?, ?, ?)', (country, full_otlega, price))
     conn.commit()
     conn.close()
-    bot.send_message(message.chat.id, f"✅ Товар добавлен!\n{country} - {full_otlega} - {price}", reply_markup=admin_menu())
+    bot.send_message(message.chat.id, f"✅ Товар добавлен!\n🌍 Страна: {country}\n⏳ Отлега: {full_otlega}\n💰 Цена: {price}", reply_markup=admin_menu())
+
+# --- АДМИН: УДАЛЕНИЕ ТОВАРА ---
+@bot.message_handler(func=lambda m: m.text == "❌ Удалить товар" and m.from_user.id in ADMIN_CACHE)
+def delete_item_start(message):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute('SELECT * FROM accounts')
+    rows = cursor.fetchall()
+    conn.close()
+
+    if not rows:
+        bot.send_message(message.chat.id, "😔 Товаров нет для удаления.")
+        return
+
+    # Вывод товаров с кнопками для удаления
+    for row in rows:
+        text = (f"🆔 ID товара: {row[0]}\n"
+                f"🌍 Страна: {row[1]}\n"
+                f"⏳ Отлега: {row[2]}\n"
+                f"💰 Цена: {row[3]}")
+        
+        markup = types.InlineKeyboardMarkup()
+        markup.add(types.InlineKeyboardButton("❌ Удалить", callback_data=f"delete_{row[0]}"))
+        
+        bot.send_message(message.chat.id, text, reply_markup=markup)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('delete_'))
+def process_delete_item(call):
+    bot.answer_callback_query(call.id)
+    item_id = int(call.data.split('_')[1])
+    
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute('DELETE FROM accounts WHERE id = ?', (item_id,))
+    conn.commit()
+    conn.close()
+    
+    bot.edit_message_text(f"✅ Товар с ID {item_id} удален!", 
+                          call.message.chat.id, 
+                          call.message.message_id)
 
 # --- АДМИН: ПРОЧЕЕ ---
 
@@ -283,6 +339,10 @@ def broadcast_start(message):
     bot.register_next_step_handler(msg, run_broadcast)
 
 def run_broadcast(message):
+    if message.text == "🏠 В главное меню":
+        bot.send_message(message.chat.id, "❌ Отменено.", reply_markup=admin_menu())
+        return
+        
     conn = get_db_connection()
     users = conn.cursor().execute('SELECT user_id FROM users').fetchall()
     conn.close()
@@ -298,8 +358,9 @@ def run_broadcast(message):
             # Копируем сообщение (поддерживает текст, фото, видео)
             bot.copy_message(user_id, message.chat.id, message.message_id)
             sent += 1
-            time.sleep(0.05) # Небольшая задержка, чтобы не словить лимиты ТГ
-        except Exception:
+            time.sleep(0.05)  # Небольшая задержка, чтобы не словить лимиты ТГ
+        except Exception as e:
+            print(f"Не удалось отправить пользователю {user_id}: {e}")
             blocked += 1
             
     bot.edit_message_text(f"✅ Рассылка завершена!\n\nПолучили: {sent}\nЗаблокировали бота: {blocked}", 
@@ -307,7 +368,10 @@ def run_broadcast(message):
 
 @bot.message_handler(func=lambda m: m.text == "🏠 В главное меню")
 def back_home(message):
-    bot.send_message(message.chat.id, "Главное меню", reply_markup=main_menu())
+    if message.from_user.id in ADMIN_CACHE:
+        bot.send_message(message.chat.id, "Главное меню", reply_markup=admin_menu())
+    else:
+        bot.send_message(message.chat.id, "Главное меню", reply_markup=main_menu())
 
 # --- ОТВЕТ АДМИНА (Reply) ---
 @bot.message_handler(func=lambda m: m.reply_to_message is not None and m.from_user.id in ADMIN_CACHE)
@@ -316,21 +380,23 @@ def admin_reply(message):
         # Пытаемся достать ID из текста исходного сообщения
         original_text = message.reply_to_message.text or message.reply_to_message.caption
         if not original_text:
+            bot.reply_to(message, "❌ В сообщении нет текста с ID пользователя.")
             return
             
         # Ищем кусок текста "ID: 123456"
-        import re
-        match = re.search(r'ID: <code>(\d+)</code>', original_text) or re.search(r'ID: (\d+)', original_text)
+        match = re.search(r'ID: <code>(\d+)</code>', original_text)
+        if not match:
+            match = re.search(r'ID: (\d+)', original_text)
         
         if match:
-            target_id = match.group(1)
+            target_id = int(match.group(1))
             bot.send_message(target_id, f"🔔 <b>Ответ от поддержки:</b>\n\n{message.text}", parse_mode="HTML")
             bot.reply_to(message, "✅ Ответ доставлен пользователю.")
         else:
             bot.reply_to(message, "❌ Не удалось найти ID пользователя в сообщении, на которое вы ответили.")
             
     except Exception as e:
-        bot.reply_to(message, f"Ошибка отправки: {e}")
+        bot.reply_to(message, f"❌ Ошибка отправки: {e}")
 
 # --- ЗАПУСК ---
 if __name__ == '__main__':
