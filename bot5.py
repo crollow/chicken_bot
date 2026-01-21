@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """
-🛡️ FINAL ANTI-RAID BOT
-Полная защита Telegram чатов от рейдов и спама
-Версия 4.0 - Финальная
+🛡️ ANTI-RAID BOT - ПОЛНАЯ ВЕРСИЯ
+Telegram: @anti_raid_system_bot
 """
 
 import asyncio
@@ -15,9 +14,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import urllib.parse
-from typing import Dict, List, Optional, Tuple, Set, Any
-from enum import Enum
-import time
+from typing import Dict, List, Optional, Tuple, Any
 
 # Telegram
 from telegram import (
@@ -26,6 +23,7 @@ from telegram import (
     InlineKeyboardButton, 
     InlineKeyboardMarkup,
     ChatMember,
+    Message,
     User
 )
 from telegram.constants import ParseMode, ChatMemberStatus, ChatType
@@ -40,47 +38,43 @@ from telegram.ext import (
 
 # ============ КОНСТАНТЫ ============
 
-DEFAULT_CONFIG = {
-    "token": "8290647556:AAHRcf50ez31bJbKchCCFr3xKazyhZUWkQQ",
-    "web_port": 8080
-}
+TOKEN = "8290647556:AAHRcf50ez31bJbKchCCFr3xKazyhZUWkQQ"
+WEB_PORT = 8080
 
-DEFAULT_CHAT_CONFIG = {
+# Настройки по умолчанию
+DEFAULT_CONFIG = {
     # Анти-флуд
-    "text_limit": 5,
-    "media_limit": 8,
-    "time_window": 7,
-    "strict_mode": False,
+    "текст_лимит": 5,
+    "медиа_лимит": 8,
+    "окно_времени": 7,
+    "строгий_режим": False,
     
     # Анти-рейд
-    "raid_threshold": 12,
-    "raid_window": 3,
-    "lockdown_duration": 10,
+    "порог_рейда": 12,
+    "окно_рейда": 3,
+    "блокировка_время": 10,
     
     # Наказания
-    "ban_duration": 2,
-    "mute_duration": 30,
+    "бан_часы": 2,
+    "мут_минуты": 30,
+    "варны_до_бана": 2,
     
     # Режимы
-    "auto_lockdown": True,
-    "auto_slowmode": False,
-    "slowmode_delay": 15,
+    "авто_блокировка": True,
+    "авто_медленный": False,
+    "задержка_медленного": 15,
     
     # Защита
-    "protect_new": True,
-    "new_member_hours": 24,
-    "ignore_admins": True,
-    "ignore_bot_admins": True,
-    
-    # Система
-    "warnings_enabled": True,
-    "warning_reset_hours": 6
+    "защита_новых": True,
+    "часы_защиты": 24,
+    "игнор_админов": True,
+    "игнор_админов_бота": True,
 }
 
 # ============ БАЗА ДАННЫХ ============
 
 class Database:
-    def __init__(self, path="bot_data.db"):
+    def __init__(self, path="anti_raid.db"):
         self.path = Path(path)
         self.conn = sqlite3.connect(self.path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
@@ -89,1547 +83,1182 @@ class Database:
     def init_db(self):
         cursor = self.conn.cursor()
         
-        # Чаты
         cursor.execute('''
-            CREATE TABLE IF NOT EXISTS chats (
-                chat_id INTEGER PRIMARY KEY,
-                owner_id INTEGER,
-                config TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                is_active BOOLEAN DEFAULT 1
+            CREATE TABLE IF NOT EXISTS чаты (
+                id INTEGER PRIMARY KEY,
+                владелец_id INTEGER,
+                настройки TEXT,
+                создано TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
         
-        # Админы бота
         cursor.execute('''
-            CREATE TABLE IF NOT EXISTS bot_admins (
-                chat_id INTEGER,
-                user_id INTEGER,
-                username TEXT,
-                added_by INTEGER,
-                added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                PRIMARY KEY (chat_id, user_id)
+            CREATE TABLE IF NOT EXISTS админы_бота (
+                чат_id INTEGER,
+                юзер_id INTEGER,
+                юзернейм TEXT,
+                добавлено TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (чат_id, юзер_id)
             )
         ''')
         
-        # Исключения
         cursor.execute('''
-            CREATE TABLE IF NOT EXISTS exempt_users (
-                chat_id INTEGER,
-                user_id INTEGER,
-                username TEXT,
-                reason TEXT,
-                added_by INTEGER,
-                added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                PRIMARY KEY (chat_id, user_id)
+            CREATE TABLE IF NOT EXISTS исключения (
+                чат_id INTEGER,
+                юзер_id INTEGER,
+                юзернейм TEXT,
+                причина TEXT,
+                добавлено TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (чат_id, юзер_id)
             )
         ''')
         
-        # Предупреждения
         cursor.execute('''
-            CREATE TABLE IF NOT EXISTS warnings (
+            CREATE TABLE IF NOT EXISTS варны (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                chat_id INTEGER,
-                user_id INTEGER,
-                warning_type TEXT,
-                admin_id INTEGER,
-                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                чат_id INTEGER,
+                юзер_id INTEGER,
+                время TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
         
-        # История сообщений
         cursor.execute('''
-            CREATE TABLE IF NOT EXISTS message_history (
+            CREATE TABLE IF NOT EXISTS история_сообщений (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                chat_id INTEGER,
-                user_id INTEGER,
-                message_type TEXT,
-                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                чат_id INTEGER,
+                юзер_id INTEGER,
+                тип TEXT,
+                время TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
         
-        # История действий
         cursor.execute('''
-            CREATE TABLE IF NOT EXISTS action_log (
+            CREATE TABLE IF NOT EXISTS логи (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                chat_id INTEGER,
-                action TEXT,
-                target_id INTEGER,
-                target_username TEXT,
-                reason TEXT,
-                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
-        
-        # Кэш username -> user_id
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS user_cache (
-                username TEXT PRIMARY KEY,
-                user_id INTEGER,
-                last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                чат_id INTEGER,
+                действие TEXT,
+                цель_id INTEGER,
+                время TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
         
         self.conn.commit()
     
-    # ===== ЧАТЫ =====
-    def get_chat_config(self, chat_id: int) -> Dict:
+    # ЧАТЫ
+    def получить_настройки(self, chat_id: int) -> Dict:
         cursor = self.conn.execute(
-            "SELECT config FROM chats WHERE chat_id = ? AND is_active = 1",
+            "SELECT настройки FROM чаты WHERE id = ?",
             (chat_id,)
         )
         row = cursor.fetchone()
-        if row and row['config']:
-            config = json.loads(row['config'])
-            # Обновляем старые конфиги
-            for key, value in DEFAULT_CHAT_CONFIG.items():
+        if row and row['настройки']:
+            config = json.loads(row['настройки'])
+            for key, value in DEFAULT_CONFIG.items():
                 if key not in config:
                     config[key] = value
             return config
-        return DEFAULT_CHAT_CONFIG.copy()
+        return DEFAULT_CONFIG.copy()
     
-    def save_chat_config(self, chat_id: int, config: Dict):
-        config_json = json.dumps(config)
+    def сохранить_настройки(self, chat_id: int, config: Dict):
         self.conn.execute(
-            "INSERT OR REPLACE INTO chats (chat_id, config) VALUES (?, ?)",
-            (chat_id, config_json)
+            "INSERT OR REPLACE INTO чаты (id, настройки) VALUES (?, ?)",
+            (chat_id, json.dumps(config))
         )
         self.conn.commit()
     
-    def set_chat_owner(self, chat_id: int, user_id: int):
+    def установить_владельца(self, chat_id: int, user_id: int):
         self.conn.execute(
-            "INSERT OR REPLACE INTO chats (chat_id, owner_id) VALUES (?, ?)",
+            "INSERT OR REPLACE INTO чаты (id, владелец_id) VALUES (?, ?)",
             (chat_id, user_id)
         )
         self.conn.commit()
-        self.add_bot_admin(chat_id, user_id, user_id, "owner")
+        self.добавить_админа(chat_id, user_id, user_id)
     
-    def get_chat_owner(self, chat_id: int) -> Optional[int]:
+    def получить_владельца(self, chat_id: int) -> Optional[int]:
         cursor = self.conn.execute(
-            "SELECT owner_id FROM chats WHERE chat_id = ?",
+            "SELECT владелец_id FROM чаты WHERE id = ?",
             (chat_id,)
         )
         row = cursor.fetchone()
-        return row['owner_id'] if row else None
+        return row['владелец_id'] if row else None
     
-    def is_chat_active(self, chat_id: int) -> bool:
-        cursor = self.conn.execute(
-            "SELECT 1 FROM chats WHERE chat_id = ? AND is_active = 1",
-            (chat_id,)
-        )
-        return cursor.fetchone() is not None
-    
-    # ===== АДМИНЫ БОТА =====
-    def add_bot_admin(self, chat_id: int, user_id: int, added_by: int, username: str = None) -> bool:
+    # АДМИНЫ
+    def добавить_админа(self, chat_id: int, user_id: int, added_by: int, username: str = None):
         try:
             self.conn.execute(
-                '''INSERT OR IGNORE INTO bot_admins 
-                   (chat_id, user_id, username, added_by) 
-                   VALUES (?, ?, ?, ?)''',
-                (chat_id, user_id, username, added_by)
+                "INSERT OR IGNORE INTO админы_бота (чат_id, юзер_id, юзернейм) VALUES (?, ?, ?)",
+                (chat_id, user_id, username)
             )
             self.conn.commit()
-            return True
-        except Exception as e:
-            logging.error(f"Error adding bot admin: {e}")
-            return False
-    
-    def remove_bot_admin(self, chat_id: int, user_id: int) -> bool:
-        try:
-            self.conn.execute(
-                "DELETE FROM bot_admins WHERE chat_id = ? AND user_id = ?",
-                (chat_id, user_id)
-            )
-            self.conn.commit()
-            return True
         except:
-            return False
+            pass
     
-    def get_bot_admins(self, chat_id: int) -> List[Tuple[int, str]]:
-        cursor = self.conn.execute(
-            "SELECT user_id, username FROM bot_admins WHERE chat_id = ?",
-            (chat_id,)
-        )
-        return [(row['user_id'], row['username']) for row in cursor.fetchall()]
-    
-    def is_bot_admin(self, chat_id: int, user_id: int) -> bool:
-        if user_id == self.get_chat_owner(chat_id):
-            return True
-        
-        cursor = self.conn.execute(
-            "SELECT 1 FROM bot_admins WHERE chat_id = ? AND user_id = ?",
+    def удалить_админа(self, chat_id: int, user_id: int):
+        self.conn.execute(
+            "DELETE FROM админы_бота WHERE чат_id = ? AND юзер_id = ?",
             (chat_id, user_id)
         )
-        return cursor.fetchone() is not None
-    
-    # ===== ИСКЛЮЧЕНИЯ =====
-    def add_exempt_user(self, chat_id: int, user_id: int, added_by: int, 
-                       username: str = None, reason: str = "") -> bool:
-        try:
-            self.conn.execute(
-                '''INSERT OR REPLACE INTO exempt_users 
-                   (chat_id, user_id, username, reason, added_by) 
-                   VALUES (?, ?, ?, ?, ?)''',
-                (chat_id, user_id, username, reason, added_by)
-            )
-            self.conn.commit()
-            return True
-        except:
-            return False
-    
-    def remove_exempt_user(self, chat_id: int, user_id: int) -> bool:
-        try:
-            self.conn.execute(
-                "DELETE FROM exempt_users WHERE chat_id = ? AND user_id = ?",
-                (chat_id, user_id)
-            )
-            self.conn.commit()
-            return True
-        except:
-            return False
-    
-    def get_exempt_users(self, chat_id: int) -> List[Tuple[int, str]]:
-        cursor = self.conn.execute(
-            "SELECT user_id, username FROM exempt_users WHERE chat_id = ?",
-            (chat_id,)
-        )
-        return [(row['user_id'], row['username']) for row in cursor.fetchall()]
-    
-    def is_exempt(self, chat_id: int, user_id: int) -> bool:
-        cursor = self.conn.execute(
-            "SELECT 1 FROM exempt_users WHERE chat_id = ? AND user_id = ?",
-            (chat_id, user_id)
-        )
-        return cursor.fetchone() is not None
-    
-    # ===== ПРЕДУПРЕЖДЕНИЯ =====
-    def add_warning(self, chat_id: int, user_id: int, warning_type: str, admin_id: int = None):
-        self.conn.execute(
-            '''INSERT INTO warnings (chat_id, user_id, warning_type, admin_id)
-               VALUES (?, ?, ?, ?)''',
-            (chat_id, user_id, warning_type, admin_id)
-        )
-        
-        # Очистка старых предупреждений
-        config = self.get_chat_config(chat_id)
-        hours = config.get("warning_reset_hours", 6)
-        time_ago = datetime.now() - timedelta(hours=hours)
-        
-        self.conn.execute(
-            "DELETE FROM warnings WHERE timestamp < ?",
-            (time_ago.timestamp(),)
-        )
-        
         self.conn.commit()
     
-    def get_warning_count(self, chat_id: int, user_id: int) -> int:
-        config = self.get_chat_config(chat_id)
-        hours = config.get("warning_reset_hours", 6)
-        time_ago = datetime.now() - timedelta(hours=hours)
+    def получить_админов(self, chat_id: int) -> List[Tuple[int, str]]:
+        cursor = self.conn.execute(
+            "SELECT юзер_id, юзернейм FROM админы_бота WHERE чат_id = ?",
+            (chat_id,)
+        )
+        return [(row['юзер_id'], row['юзернейм']) for row in cursor.fetchall()]
+    
+    def является_админом(self, chat_id: int, user_id: int) -> bool:
+        if user_id == self.получить_владельца(chat_id):
+            return True
         
         cursor = self.conn.execute(
-            '''SELECT COUNT(*) as count FROM warnings 
-               WHERE chat_id = ? AND user_id = ? AND timestamp > ?''',
-            (chat_id, user_id, time_ago.timestamp())
+            "SELECT 1 FROM админы_бота WHERE чат_id = ? AND юзер_id = ?",
+            (chat_id, user_id)
+        )
+        return cursor.fetchone() is not None
+    
+    # ИСКЛЮЧЕНИЯ
+    def добавить_исключение(self, chat_id: int, user_id: int, username: str = None, причина: str = ""):
+        try:
+            self.conn.execute(
+                "INSERT OR REPLACE INTO исключения (чат_id, юзер_id, юзернейм, причина) VALUES (?, ?, ?, ?)",
+                (chat_id, user_id, username, причина)
+            )
+            self.conn.commit()
+        except:
+            pass
+    
+    def удалить_исключение(self, chat_id: int, user_id: int):
+        self.conn.execute(
+            "DELETE FROM исключения WHERE чат_id = ? AND юзер_id = ?",
+            (chat_id, user_id)
+        )
+        self.conn.commit()
+    
+    def получить_исключения(self, chat_id: int) -> List[Tuple[int, str]]:
+        cursor = self.conn.execute(
+            "SELECT юзер_id, юзернейм FROM исключения WHERE чат_id = ?",
+            (chat_id,)
+        )
+        return [(row['юзер_id'], row['юзернейм']) for row in cursor.fetchall()]
+    
+    def является_исключением(self, chat_id: int, user_id: int) -> bool:
+        cursor = self.conn.execute(
+            "SELECT 1 FROM исключения WHERE чат_id = ? AND юзер_id = ?",
+            (chat_id, user_id)
+        )
+        return cursor.fetchone() is not None
+    
+    # ВАРНЫ
+    def добавить_варн(self, chat_id: int, user_id: int):
+        self.conn.execute(
+            "INSERT INTO варны (чат_id, юзер_id) VALUES (?, ?)",
+            (chat_id, user_id)
+        )
+        # Очистка старых варнов (старше 6 часов)
+        час_назад = datetime.now() - timedelta(hours=6)
+        self.conn.execute(
+            "DELETE FROM варны WHERE время < ?",
+            (час_назад.timestamp(),)
+        )
+        self.conn.commit()
+    
+    def получить_варны(self, chat_id: int, user_id: int) -> int:
+        час_назад = datetime.now() - timedelta(hours=6)
+        cursor = self.conn.execute(
+            "SELECT COUNT(*) as count FROM варны WHERE чат_id = ? AND юзер_id = ? AND время > ?",
+            (chat_id, user_id, час_назад.timestamp())
         )
         return cursor.fetchone()['count']
     
-    def clear_warnings(self, chat_id: int, user_id: int):
+    def очистить_варны(self, chat_id: int, user_id: int):
         self.conn.execute(
-            "DELETE FROM warnings WHERE chat_id = ? AND user_id = ?",
+            "DELETE FROM варны WHERE чат_id = ? AND юзер_id = ?",
             (chat_id, user_id)
         )
         self.conn.commit()
     
-    # ===== ИСТОРИЯ СООБЩЕНИЙ =====
-    def add_message(self, chat_id: int, user_id: int, message_type: str):
+    # ИСТОРИЯ
+    def добавить_сообщение(self, chat_id: int, user_id: int, тип: str):
         self.conn.execute(
-            "INSERT INTO message_history (chat_id, user_id, message_type) VALUES (?, ?, ?)",
-            (chat_id, user_id, message_type)
+            "INSERT INTO история_сообщений (чат_id, юзер_id, тип) VALUES (?, ?, ?)",
+            (chat_id, user_id, тип)
         )
-        
         # Очистка старых сообщений (старше 1 часа)
-        hour_ago = datetime.now() - timedelta(hours=1)
+        час_назад = datetime.now() - timedelta(hours=1)
         self.conn.execute(
-            "DELETE FROM message_history WHERE timestamp < ?",
-            (hour_ago.timestamp(),)
+            "DELETE FROM история_сообщений WHERE время < ?",
+            (час_назад.timestamp(),)
         )
-        
         self.conn.commit()
     
-    def get_message_stats(self, chat_id: int, user_id: int, seconds: int) -> Dict[str, int]:
-        time_ago = datetime.now() - timedelta(seconds=seconds)
+    def получить_статистику(self, chat_id: int, user_id: int, секунды: int) -> Dict[str, int]:
+        время_назад = datetime.now() - timedelta(seconds=секунды)
         
         cursor = self.conn.execute(
-            '''SELECT message_type, COUNT(*) as count 
-               FROM message_history 
-               WHERE chat_id = ? AND user_id = ? AND timestamp > ?
-               GROUP BY message_type''',
-            (chat_id, user_id, time_ago.timestamp())
+            "SELECT тип, COUNT(*) as count FROM история_сообщений WHERE чат_id = ? AND юзер_id = ? AND время > ? GROUP BY тип",
+            (chat_id, user_id, время_назад.timestamp())
         )
         
-        stats = {"text": 0, "media": 0, "total": 0}
+        stats = {"текст": 0, "медиа": 0, "всего": 0}
         for row in cursor.fetchall():
-            msg_type = row['message_type']
-            count = row['count']
-            
-            if msg_type == "text":
-                stats["text"] = count
+            if row['тип'] == "текст":
+                stats["текст"] = row['count']
             else:
-                stats["media"] += count
-            
-            stats["total"] += count
+                stats["медиа"] += row['count']
+            stats["всего"] += row['count']
         
         return stats
     
-    def get_chat_activity(self, chat_id: int, seconds: int) -> float:
-        time_ago = datetime.now() - timedelta(seconds=seconds)
-        
+    def получить_активность(self, chat_id: int, секунды: int) -> float:
+        время_назад = datetime.now() - timedelta(seconds=секунды)
         cursor = self.conn.execute(
-            "SELECT COUNT(*) as count FROM message_history WHERE chat_id = ? AND timestamp > ?",
-            (chat_id, time_ago.timestamp())
+            "SELECT COUNT(*) as count FROM история_сообщений WHERE чат_id = ? AND время > ?",
+            (chat_id, время_назад.timestamp())
         )
-        
         count = cursor.fetchone()['count']
-        return count / seconds if seconds > 0 else 0
+        return count / секунды if секунды > 0 else 0
     
-    # ===== ЛОГИРОВАНИЕ ДЕЙСТВИЙ =====
-    def log_action(self, chat_id: int, action: str, target_id: int = None, 
-                  target_username: str = None, reason: str = ""):
+    # ЛОГИ
+    def записать_лог(self, chat_id: int, действие: str, цель_id: int = None):
         self.conn.execute(
-            '''INSERT INTO action_log (chat_id, action, target_id, target_username, reason)
-               VALUES (?, ?, ?, ?, ?)''',
-            (chat_id, action, target_id, target_username, reason)
+            "INSERT INTO логи (чат_id, действие, цель_id) VALUES (?, ?, ?)",
+            (chat_id, действие, цель_id)
         )
         self.conn.commit()
     
-    def get_recent_actions(self, chat_id: int, limit: int = 10) -> List[Dict]:
+    def получить_логи(self, chat_id: int, limit: int = 10) -> List[Dict]:
         cursor = self.conn.execute(
-            '''SELECT action, target_id, target_username, reason, timestamp 
-               FROM action_log 
-               WHERE chat_id = ? 
-               ORDER BY timestamp DESC 
-               LIMIT ?''',
+            "SELECT действие, цель_id, время FROM логи WHERE чат_id = ? ORDER BY время DESC LIMIT ?",
             (chat_id, limit)
         )
-        
         return [dict(row) for row in cursor.fetchall()]
     
-    # ===== КЭШ USERNAME =====
-    def cache_user(self, username: str, user_id: int):
-        self.conn.execute(
-            "INSERT OR REPLACE INTO user_cache (username, user_id) VALUES (?, ?)",
-            (username.lower().replace('@', ''), user_id)
-        )
-        self.conn.commit()
-    
-    def get_user_from_cache(self, username: str) -> Optional[int]:
-        cursor = self.conn.execute(
-            "SELECT user_id FROM user_cache WHERE username = ?",
-            (username.lower().replace('@', ''),)
-        )
-        row = cursor.fetchone()
-        return row['user_id'] if row else None
-    
-    # ===== СТАТИСТИКА =====
-    def get_stats(self) -> Dict:
-        cursor = self.conn.execute("SELECT COUNT(DISTINCT chat_id) as chats FROM chats WHERE is_active = 1")
-        chats = cursor.fetchone()['chats'] or 0
+    # СТАТИСТИКА
+    def получить_статистику_бота(self) -> Dict:
+        cursor = self.conn.execute("SELECT COUNT(DISTINCT id) as чаты FROM чаты")
+        чаты = cursor.fetchone()['чаты'] or 0
         
-        cursor = self.conn.execute("SELECT COUNT(*) as actions FROM action_log")
-        actions = cursor.fetchone()['actions'] or 0
+        cursor = self.conn.execute("SELECT COUNT(*) as действия FROM логи")
+        действия = cursor.fetchone()['действия'] or 0
         
-        cursor = self.conn.execute("SELECT COUNT(DISTINCT user_id) as exempt FROM exempt_users")
-        exempt = cursor.fetchone()['exempt'] or 0
+        cursor = self.conn.execute("SELECT COUNT(DISTINCT юзер_id) as исключения FROM исключения")
+        исключения = cursor.fetchone()['исключения'] or 0
         
-        cursor = self.conn.execute("SELECT COUNT(*) as messages FROM message_history")
-        messages = cursor.fetchone()['messages'] or 0
-        
-        return {
-            "chats": chats,
-            "actions": actions,
-            "exempt_users": exempt,
-            "messages_processed": messages
-        }
-    
-    def close(self):
-        self.conn.close()
+        return {"чаты": чаты, "действия": действия, "исключения": исключения}
 
-# Глобальная БД
-db = Database()
+база = Database()
 
 # ============ ЛОГИРОВАНИЕ ============
 
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO,
-    handlers=[
-        logging.FileHandler('bot.log', encoding='utf-8'),
-        logging.StreamHandler()
-    ]
+    level=logging.INFO
 )
-logger = logging.getLogger(__name__)
+логгер = logging.getLogger(__name__)
 
 # ============ ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ============
 
-async def resolve_user_identifier(identifier: str, context: ContextTypes.DEFAULT_TYPE, 
-                                 chat_id: int = None) -> Optional[Tuple[int, str]]:
-    """
-    Разрешает идентификатор пользователя (username или ID)
-    Возвращает (user_id, username) или None
-    """
-    identifier = identifier.strip().replace('@', '')
+async def разрешить_пользователя(идентификатор: str, контекст: ContextTypes.DEFAULT_TYPE, 
+                                сообщение: Message = None) -> Optional[Tuple[int, str]]:
+    """Определяет пользователя по reply, username или ID"""
     
-    # Если это число, пробуем как ID
-    if identifier.isdigit():
-        user_id = int(identifier)
-        
-        # Проверяем существование пользователя
-        try:
-            user = await context.bot.get_chat(user_id)
-            return user_id, user.username or user.first_name
-        except:
-            # Проверяем в кэше
-            return user_id, None
+    # Ответ на сообщение
+    if сообщение and сообщение.reply_to_message:
+        reply_user = сообщение.reply_to_message.from_user
+        if reply_user:
+            return reply_user.id, reply_user.username or reply_user.first_name
     
-    # Ищем в кэше
-    cached_id = db.get_user_from_cache(identifier)
-    if cached_id:
-        return cached_id, identifier
+    идентификатор = идентификатор.strip().replace('@', '')
     
-    # Если это username, ищем через mention
-    if chat_id:
-        try:
-            # Пробуем найти пользователя в чате
-            # Это упрощённый подход - в реальности нужно использовать другие методы
-            pass
-        except:
-            pass
+    # Если пусто и есть reply
+    if not идентификатор and сообщение and сообщение.reply_to_message:
+        reply_user = сообщение.reply_to_message.from_user
+        if reply_user:
+            return reply_user.id, reply_user.username or reply_user.first_name
+    
+    # Если ID
+    if идентификатор.isdigit():
+        return int(идентификатор), None
     
     return None
 
-async def is_telegram_admin(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    """Проверяет, является ли пользователь админом в Telegram"""
-    try:
-        member = await context.bot.get_chat_member(chat_id, user_id)
-        return member.status in [ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER]
-    except:
-        return False
-
-async def is_protected(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    """Проверяет, защищён ли пользователь от действий бота"""
-    config = db.get_chat_config(chat_id)
+async def защищенный(chat_id: int, user_id: int, контекст: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Проверяет защищён ли пользователь"""
+    настройки = база.получить_настройки(chat_id)
     
-    # Проверка исключений
-    if db.is_exempt(chat_id, user_id):
+    if база.является_исключением(chat_id, user_id):
         return True
     
-    # Проверка админов бота
-    if config.get("ignore_bot_admins", True) and db.is_bot_admin(chat_id, user_id):
+    if настройки.get("игнор_админов_бота", True) and база.является_админом(chat_id, user_id):
         return True
     
-    # Проверка Telegram админов
-    if config.get("ignore_admins", True):
-        if await is_telegram_admin(chat_id, user_id, context):
-            return True
-    
-    # Защита новых участников
-    if config.get("protect_new", True):
+    if настройки.get("игнор_админов", True):
         try:
-            member = await context.bot.get_chat_member(chat_id, user_id)
+            member = await контекст.bot.get_chat_member(chat_id, user_id)
+            if member.status in [ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER]:
+                return True
+        except:
+            pass
+    
+    if настройки.get("защита_новых", True):
+        try:
+            member = await контекст.bot.get_chat_member(chat_id, user_id)
             if hasattr(member, 'joined_date') and member.joined_date:
-                join_time = datetime.fromtimestamp(member.joined_date)
-                hours = config.get("new_member_hours", 24)
-                if datetime.now() - join_time < timedelta(hours=hours):
+                время_вступления = datetime.fromtimestamp(member.joined_date)
+                if datetime.now() - время_вступления < timedelta(hours=24):
                     return True
         except:
             pass
     
     return False
 
-async def get_message_type(update: Update) -> str:
+async def тип_сообщения(update: Update) -> str:
     """Определяет тип сообщения"""
     if update.message.text:
-        return "text"
-    elif update.message.photo:
-        return "photo"
-    elif update.message.animation:
-        return "gif"
+        return "текст"
+    elif update.message.photo or update.message.video or update.message.animation:
+        return "медиа"
     elif update.message.sticker:
-        return "sticker"
-    elif update.message.video:
-        return "video"
-    elif update.message.voice:
-        return "voice"
-    elif update.message.video_note:
-        return "video_note"
-    elif update.message.document:
-        return "document"
+        return "стикер"
     else:
-        return "other"
+        return "другое"
 
-# ============ ОСНОВНАЯ ЛОГИКА ЗАЩИТЫ ============
+# ============ ЗАЩИТА ============
 
-async def check_flood(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    """Проверка на флуд"""
-    chat = update.effective_chat
-    user = update.effective_user
+async def проверка_флуда(update: Update, контекст: ContextTypes.DEFAULT_TYPE) -> bool:
+    чат = update.effective_chat
+    пользователь = update.effective_user
     
-    if chat.type == ChatType.PRIVATE:
+    if чат.type == ChatType.PRIVATE:
         return False
     
-    config = db.get_chat_config(chat.id)
-    
-    # Проверка защиты
-    if await is_protected(chat.id, user.id, context):
+    if await защищенный(chat.id, пользователь.id, контекст):
         return False
     
-    # Сохраняем сообщение в историю
-    msg_type = await get_message_type(update)
-    db.add_message(chat.id, user.id, msg_type)
+    тип = await тип_сообщения(update)
+    база.добавить_сообщение(chat.id, пользователь.id, тип)
     
-    # Получаем статистику
-    stats = db.get_message_stats(chat.id, user.id, config["time_window"])
+    настройки = база.получить_настройки(chat.id)
+    статистика = база.получить_статистику(chat.id, пользователь.id, настройки["окно_времени"])
     
-    # Проверяем лимиты
-    text_limit = config["text_limit"]
-    media_limit = config["media_limit"]
+    лимит_текста = настройки["текст_лимит"]
+    лимит_медиа = настройки["медиа_лимит"]
     
-    text_violation = stats["text"] >= text_limit
-    media_violation = stats["media"] >= media_limit
-    
-    # В строгом режиме проверяем общее количество
-    if config.get("strict_mode", False):
-        total_violation = stats["total"] >= (text_limit + media_limit) // 2
-        violation = text_violation or media_violation or total_violation
-    else:
-        violation = text_violation or media_violation
-    
-    if violation:
-        # Проверяем предупреждения
-        warning_count = db.get_warning_count(chat.id, user.id)
+    if статистика["текст"] >= лимит_текста or статистика["медиа"] >= лимит_медиа:
+        варны = база.получить_варны(chat.id, пользователь.id)
+        варны_до_бана = настройки.get("варны_до_бана", 2)
         
-        if config.get("warnings_enabled", True) and warning_count < 2:
-            # Выдаём предупреждение
-            db.add_warning(chat.id, user.id, "flood")
-            
-            warning_text = f"⚠️ Предупреждение {warning_count + 1}/2: Флуд"
-            if text_violation:
-                warning_text += f" ({stats['text']} текстовых сообщений)"
-            elif media_violation:
-                warning_text += f" ({stats['media']} медиа сообщений)"
-            
-            await update.message.reply_text(warning_text)
+        if варны < варны_до_бана - 1:
+            база.добавить_варн(chat.id, пользователь.id)
+            await update.message.reply_text(f"⚠️ Предупреждение {варны + 1}/{варны_до_бана}")
             return True
-        
-        # Применяем наказание
-        try:
-            if config.get("ban_duration", 0) > 0:
-                ban_until = datetime.now() + timedelta(hours=config["ban_duration"])
-                await context.bot.ban_chat_member(
-                    chat_id=chat.id,
-                    user_id=user.id,
-                    until_date=int(ban_until.timestamp())
-                )
+        else:
+            try:
+                if настройки.get("бан_часы", 0) > 0:
+                    время_бана = datetime.now() + timedelta(hours=настройки["бан_часы"])
+                    await контекст.bot.ban_chat_member(
+                        chat_id=chat.id,
+                        user_id=пользователь.id,
+                        until_date=int(время_бана.timestamp())
+                    )
+                    действие = "бан"
+                    время = f"{настройки['бан_часы']}ч"
+                else:
+                    время_мута = datetime.now() + timedelta(minutes=настройки.get("мут_минуты", 30))
+                    await контекст.bot.restrict_chat_member(
+                        chat_id=chat.id,
+                        user_id=пользователь.id,
+                        permissions=ChatPermissions(can_send_messages=False),
+                        until_date=int(время_мута.timestamp())
+                    )
+                    действие = "мут"
+                    время = f"{настройки['мут_минуты']}м"
                 
-                action = "ban"
-                duration = f"{config['ban_duration']}ч"
-            else:
-                # Мут вместо бана
-                mute_until = datetime.now() + timedelta(minutes=config.get("mute_duration", 30))
-                permissions = ChatPermissions(
-                    can_send_messages=False,
-                    can_send_other_messages=False,
-                    can_add_web_page_previews=False
-                )
+                база.записать_лог(chat.id, действие, пользователь.id)
+                база.очистить_варны(chat.id, пользователь.id)
                 
-                await context.bot.restrict_chat_member(
-                    chat_id=chat.id,
-                    user_id=user.id,
-                    permissions=permissions,
-                    until_date=int(mute_until.timestamp())
-                )
+                await update.message.reply_text(f"🚨 Пользователь {'забанен' if действие == 'бан' else 'замучен'} на {время}")
+                return True
                 
-                action = "mute"
-                duration = f"{config['mute_duration']}м"
-            
-            # Логируем действие
-            db.log_action(
-                chat.id, 
-                action, 
-                user.id,
-                user.username,
-                f"Флуд: текст={stats['text']}, медиа={stats['media']}"
-            )
-            
-            # Оповещение
-            await update.message.reply_text(
-                f"🚨 Пользователь {'забанен' if action == 'ban' else 'замучен'} "
-                f"на {duration} за флуд."
-            )
-            
-            # Сбрасываем предупреждения
-            db.clear_warnings(chat.id, user.id)
-            
-            return True
-            
-        except Exception as e:
-            logger.error(f"Ошибка наказания: {e}")
+            except Exception as e:
+                логгер.error(f"Ошибка: {e}")
     
     return False
 
-async def check_raid(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
-    """Проверка на рейд"""
-    config = db.get_chat_config(chat_id)
+async def проверка_рейда(chat_id: int, контекст: ContextTypes.DEFAULT_TYPE):
+    настройки = база.получить_настройки(chat_id)
+    активность = база.получить_активность(chat_id, настройки["окно_рейда"])
     
-    activity = db.get_chat_activity(chat_id, config["raid_window"])
-    
-    if activity >= config["raid_threshold"]:
-        if config["auto_lockdown"]:
+    if активность >= настройки["порог_рейда"]:
+        if настройки["авто_блокировка"]:
             try:
-                # Блокировка чата
-                await context.bot.set_chat_permissions(
+                await контекст.bot.set_chat_permissions(
                     chat_id=chat_id,
-                    permissions=ChatPermissions(
-                        can_send_messages=False,
-                        can_send_other_messages=False,
-                        can_add_web_page_previews=False,
-                        can_change_info=False,
-                        can_invite_users=False,
-                        can_pin_messages=False
-                    )
+                    permissions=ChatPermissions(can_send_messages=False)
+                )
+                база.записать_лог(chat_id, "блокировка")
+                await контекст.bot.send_message(
+                    chat_id=chat_id,
+                    text=f"🔒 Чат заблокирован на {настройки['блокировка_время']} минут"
                 )
                 
-                db.log_action(chat_id, "lockdown", reason=f"Рейд: {activity:.1f} сообщ/сек")
-                
-                duration = config.get("lockdown_duration", 10)
-                await context.bot.send_message(
-                    chat_id=chat_id,
-                    text=f"🔒 Чат заблокирован на {duration} минут из-за рейда."
-                )
-                
-                # Авторазблокировка через N минут
-                async def auto_unlock():
-                    await asyncio.sleep(duration * 60)
+                async def разблокировать():
+                    await asyncio.sleep(настройки['блокировка_время'] * 60)
                     try:
-                        await context.bot.set_chat_permissions(
+                        await контекст.bot.set_chat_permissions(
                             chat_id=chat_id,
-                            permissions=ChatPermissions(
-                                can_send_messages=True,
-                                can_send_other_messages=True,
-                                can_add_web_page_previews=True,
-                                can_change_info=False,
-                                can_invite_users=True,
-                                can_pin_messages=False
-                            )
-                        )
-                        await context.bot.send_message(
-                            chat_id=chat_id,
-                            text="🔓 Чат автоматически разблокирован."
+                            permissions=ChatPermissions(can_send_messages=True)
                         )
                     except:
                         pass
                 
-                asyncio.create_task(auto_unlock())
+                asyncio.create_task(разблокировать())
                 
             except Exception as e:
-                logger.error(f"Ошибка блокировки: {e}")
-        
-        elif config["auto_slowmode"]:
+                логгер.error(f"Ошибка блокировки: {e}")
+        elif настройки["авто_медленный"]:
             try:
-                await context.bot.set_chat_permissions(
+                await контекст.bot.set_chat_permissions(
                     chat_id=chat_id,
-                    permissions=ChatPermissions(
-                        can_send_messages=True,
-                        can_send_other_messages=True
-                    ),
-                    slow_mode_delay=config["slowmode_delay"]
+                    permissions=ChatPermissions(can_send_messages=True),
+                    slow_mode_delay=настройки["задержка_медленного"]
                 )
-                
-                db.log_action(chat_id, "slowmode", reason=f"Рейд: {activity:.1f} сообщ/сек")
-                
-                await context.bot.send_message(
+                await контекст.bot.send_message(
                     chat_id=chat_id,
-                    text=f"🐢 Включен медленный режим: {config['slowmode_delay']} сек."
+                    text=f"🐢 Медленный режим: {настройки['задержка_медленного']} сек"
                 )
-            except Exception as e:
-                logger.error(f"Ошибка slowmode: {e}")
+            except:
+                pass
 
-async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Главный обработчик сообщений"""
+async def обработчик_сообщений(update: Update, контекст: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.effective_chat:
         return
     
-    chat = update.effective_chat
-    
-    if chat.type == ChatType.PRIVATE:
-        # В ЛС - только команды
+    чат = update.effective_chat
+    if чат.type == ChatType.PRIVATE:
         return
     
-    # Проверяем флуд
-    is_flood = await check_flood(update, context)
-    
-    # Проверяем рейд (если не флуд)
-    if not is_flood:
-        await check_raid(chat.id, context)
+    флуд = await проверка_флуда(update, контекст)
+    if not флуд:
+        await проверка_рейда(chat.id, контекст)
 
-# ============ КОМАНДЫ УПРАВЛЕНИЯ ============
+# ============ КОМАНДЫ ============
 
-async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Команда /start"""
-    text = """🛡️ Anti-Raid Bot
+async def команда_старт(update: Update, контекст: ContextTypes.DEFAULT_TYPE):
+    текст = """🛡️ Anti-Raid Bot
 
-Полная защита чатов от рейдов и спама.
-
-📋 Основные команды:
-/setup - Настройка защиты
-/settings - Текущие настройки
-/status - Статус защиты
-/lock - Блокировка чата
+📋 Команды:
+/setup - Настройка
+/settings - Настройки
+/status - Статус
+/lock - Блокировка
 /unlock - Разблокировка
 /slow <сек> - Медленный режим
 /normal - Выключить медленный режим
 
-👥 Управление исключениями:
-/exempt <user> - Добавить исключение
-/unexempt <user> - Удалить исключение
-/exemptlist - Список исключений
+👥 Команды через ! (работают с reply):
+!адм *ответ* - Добавить админа
+!снять *ответ* - Удалить админа
+!искл *ответ* - Добавить исключение
+!нискл *ответ* - Удалить исключение
+!варн *ответ* - Выдать варн
+!варны *ответ* - Посмотреть варны
+!снятьварны *ответ* - Снять варны
 
-👑 Управление админами:
-/promote <user> - Добавить админа бота
-/demote <user> - Удалить админа бота
-/admins - Список админов бота
+📊 Другие:
+/админы - Список админов
+/исключения - Список исключений
+/stats - Статистика
+/logs - Логи
 
-📊 Статистика:
-/stats - Статистика чата
-/logs - Последние действия
-/warnings <user> - Предупреждения
-
-💡 Как добавить пользователя:
-• /exempt username (без @)
-• /exempt 123456789 (ID пользователя)
-• /promote username
-• /promote 123456789
+💡 Пример: Ответьте на сообщение и напишите !адм
 """
-    await update.message.reply_text(text)
+    await update.message.reply_text(текст)
 
-async def setup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Настройка бота в чате"""
-    chat = update.effective_chat
-    user = update.effective_user
+async def команда_настройка(update: Update, контекст: ContextTypes.DEFAULT_TYPE):
+    чат = update.effective_chat
+    пользователь = update.effective_user
     
-    if chat.type == ChatType.PRIVATE:
-        await update.message.reply_text("Добавьте меня в группу для настройки.")
+    if чат.type == ChatType.PRIVATE:
+        await update.message.reply_text("В группе")
         return
     
-    # Проверяем права Telegram
     try:
-        member = await context.bot.get_chat_member(chat.id, user.id)
+        member = await контекст.bot.get_chat_member(chat.id, пользователь.id)
         if member.status not in [ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER]:
-            await update.message.reply_text("Требуются права администратора.")
+            await update.message.reply_text("Нужны права админа")
             return
-    except Exception as e:
-        logger.error(f"Setup error: {e}")
-        await update.message.reply_text("Ошибка проверки прав.")
+    except:
+        await update.message.reply_text("Ошибка")
         return
     
-    # Устанавливаем владельца
-    owner = db.get_chat_owner(chat.id)
-    if not owner:
-        db.set_chat_owner(chat.id, user.id)
-        db.cache_user(user.username or str(user.id), user.id)
-        await update.message.reply_text("✅ Вы стали владельцем защиты в этом чате.")
+    владелец = база.получить_владельца(chat.id)
+    if not владелец:
+        база.установить_владельца(chat.id, пользователь.id)
+        await update.message.reply_text("✅ Вы владелец")
     
-    # Меню настроек
-    keyboard = [
-        [InlineKeyboardButton("📊 Анти-флуд", callback_data="menu_flood")],
-        [InlineKeyboardButton("🛡️ Анти-рейд", callback_data="menu_raid")],
-        [InlineKeyboardButton("⚙️ Настройки", callback_data="menu_settings")],
-        [InlineKeyboardButton("👥 Исключения", callback_data="menu_exempt")],
-        [InlineKeyboardButton("👑 Админы", callback_data="menu_admins")],
-        [InlineKeyboardButton("📊 Статистика", callback_data="menu_stats")]
+    клавиатура = [
+        [InlineKeyboardButton("📊 Анти-флуд", callback_data="меню_флуд")],
+        [InlineKeyboardButton("🛡️ Анти-рейд", callback_data="меню_рейд")],
+        [InlineKeyboardButton("⚙️ Настройки", callback_data="меню_настройки")],
+        [InlineKeyboardButton("👥 Исключения", callback_data="меню_исключения")],
+        [InlineKeyboardButton("👑 Админы", callback_data="меню_админы")],
+        [InlineKeyboardButton("📊 Статистика", callback_data="меню_статистика")]
     ]
     
     await update.message.reply_text(
-        "⚙️ Панель управления защитой\nВыберите раздел:",
-        reply_markup=InlineKeyboardMarkup(keyboard)
+        "⚙️ Панель управления:",
+        reply_markup=InlineKeyboardMarkup(клавиатура)
     )
 
-async def settings_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Текущие настройки"""
-    chat = update.effective_chat
+async def команда_настройки(update: Update, контекст: ContextTypes.DEFAULT_TYPE):
+    чат = update.effective_chat
     
-    if chat.type == ChatType.PRIVATE:
-        await update.message.reply_text("Используйте в группе.")
+    if чат.type == ChatType.PRIVATE:
+        await update.message.reply_text("В группе")
         return
     
-    config = db.get_chat_config(chat.id)
+    настройки = база.получить_настройки(chat.id)
     
-    text = f"""⚙️ Текущие настройки защиты:
+    текст = f"""⚙️ Настройки:
 
 📊 Анти-флуд:
-• Текст: {config['text_limit']} сообщ. за {config['time_window']} сек
-• Медиа: {config['media_limit']} сообщ. за {config['time_window']} сек
-• Строгий режим: {'✅' if config['strict_mode'] else '❌'}
+• Текст: {настройки['текст_лимит']}/{настройки['окно_времени']}сек
+• Медиа: {настройки['медиа_лимит']}/{настройки['окно_времени']}сек
+• Строгий: {'✅' if настройки['строгий_режим'] else '❌'}
 
 🛡️ Анти-рейд:
-• Порог: {config['raid_threshold']} сообщ/сек
-• Окно: {config['raid_window']} сек
-• Блокировка: {config['lockdown_duration']} мин
+• Порог: {настройки['порог_рейда']}/сек
+• Блокировка: {настройки['блокировка_время']}м
 
 ⚖️ Наказания:
-• Бан: {config['ban_duration']} ч
-• Мут: {config['mute_duration']} м
+• Бан: {настройки['бан_часы']}ч
+• Мут: {настройки['мут_минуты']}м
+• Варны до бана: {настройки['варны_до_бана']}
 
-🔧 Режимы:
-• Auto-Lockdown: {'✅' if config['auto_lockdown'] else '❌'}
-• Auto-Slowmode: {'✅' if config['auto_slowmode'] else '❌'}
-• Задержка: {config['slowmode_delay']} сек
-
-🛡️ Защита:
-• Новые участники: {'✅' if config['protect_new'] else '❌'}
-• Telegram админы: {'✅' if config['ignore_admins'] else '❌'}
-• Админы бота: {'✅' if config['ignore_bot_admins'] else '❌'}
-
-📈 Статистика:
-• Исключения: {len(db.get_exempt_users(chat.id))}
-• Админы бота: {len(db.get_bot_admins(chat.id))}
+👥 Защита:
+• Исключения: {len(база.получить_исключения(chat.id))}
+• Админы: {len(база.получить_админов(chat.id))}
 """
     
-    await update.message.reply_text(text)
+    await update.message.reply_text(текст)
 
-async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Статус защиты"""
-    chat = update.effective_chat
+async def команда_адм(update: Update, контекст: ContextTypes.DEFAULT_TYPE):
+    """!адм - добавить админа"""
+    чат = update.effective_chat
+    пользователь = update.effective_user
+    сообщение = update.message
     
-    if chat.type == ChatType.PRIVATE:
-        await update.message.reply_text("Используйте в группе.")
+    if чат.type == ChatType.PRIVATE:
         return
     
-    config = db.get_chat_config(chat.id)
-    active = db.is_chat_active(chat.id)
-    
-    text = f"""🛡️ Статус защиты
-
-{'✅ АКТИВНА' if active else '❌ НЕАКТИВНА'}
-
-📊 Текущие ограничения:
-• Текст: {config['text_limit']} сообщ/{config['time_window']}сек
-• Медиа: {config['media_limit']} сообщ/{config['time_window']}сек
-• Рейд: {config['raid_threshold']} сообщ/сек
-
-👥 Исключения: {len(db.get_exempt_users(chat.id))}
-👑 Админы бота: {len(db.get_bot_admins(chat.id))}
-
-📈 Активность (за 1 мин): {db.get_chat_activity(chat.id, 60):.1f} сообщ/сек
-"""
-    
-    await update.message.reply_text(text)
-
-async def lock_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Ручная блокировка чата"""
-    chat = update.effective_chat
-    user = update.effective_user
-    
-    if not db.is_bot_admin(chat.id, user.id):
-        await update.message.reply_text("Требуются права админа бота.")
+    владелец = база.получить_владельца(chat.id)
+    if пользователь.id != владелец:
+        await update.message.reply_text("Только владелец")
         return
     
-    duration = 30  # минут
-    if context.args:
+    аргумент = контекст.args[0] if контекст.args else ""
+    результат = await разрешить_пользователя(аргумент, контекст, сообщение)
+    
+    if not результат:
+        await update.message.reply_text("Ответьте на сообщение или укажите ID")
+        return
+    
+    цель_id, цель_юзернейм = результат
+    
+    if цель_id == пользователь.id:
+        return
+    
+    бот_инфо = await контекст.bot.get_me()
+    if цель_id == бот_инфо.id:
+        await update.message.reply_text("Нельзя бота")
+        return
+    
+    база.добавить_админа(chat.id, цель_id, пользователь.id, цель_юзернейм)
+    отображение = f"@{цель_юзернейм}" if цель_юзернейм else f"ID {цель_id}"
+    await update.message.reply_text(f"✅ {отображение} теперь админ")
+
+async def команда_снять(update: Update, контекст: ContextTypes.DEFAULT_TYPE):
+    """!снять - удалить админа"""
+    чат = update.effective_chat
+    пользователь = update.effective_user
+    сообщение = update.message
+    
+    if чат.type == ChatType.PRIVATE:
+        return
+    
+    владелец = база.получить_владельца(chat.id)
+    if пользователь.id != владелец:
+        await update.message.reply_text("Только владелец")
+        return
+    
+    аргумент = контекст.args[0] if контекст.args else ""
+    результат = await разрешить_пользователя(аргумент, контекст, сообщение)
+    
+    if not результат:
+        await update.message.reply_text("Ответьте на сообщение или укажите ID")
+        return
+    
+    цель_id, цель_юзернейм = результат
+    
+    if цель_id == владелец:
+        await update.message.reply_text("Нельзя владельца")
+        return
+    
+    база.удалить_админа(chat.id, цель_id)
+    отображение = f"@{цель_юзернейм}" if цель_юзернейм else f"ID {цель_id}"
+    await update.message.reply_text(f"✅ {отображение} больше не админ")
+
+async def команда_искл(update: Update, контекст: ContextTypes.DEFAULT_TYPE):
+    """!искл - добавить исключение"""
+    чат = update.effective_chat
+    пользователь = update.effective_user
+    сообщение = update.message
+    
+    if чат.type == ChatType.PRIVATE:
+        return
+    
+    if not база.является_админом(chat.id, пользователь.id):
+        await update.message.reply_text("Нужны права")
+        return
+    
+    аргумент = контекст.args[0] if контекст.args else ""
+    результат = await разрешить_пользователя(аргумент, контекст, сообщение)
+    
+    if not результат:
+        await update.message.reply_text("Ответьте на сообщение или укажите ID")
+        return
+    
+    цель_id, цель_юзернейм = результат
+    
+    база.добавить_исключение(chat.id, цель_id, цель_юзернейм, "команда")
+    отображение = f"@{цель_юзернейм}" if цель_юзернейм else f"ID {цель_id}"
+    await update.message.reply_text(f"✅ {отображение} в исключениях")
+
+async def команда_нискл(update: Update, контекст: ContextTypes.DEFAULT_TYPE):
+    """!нискл - удалить исключение"""
+    чат = update.effective_chat
+    пользователь = update.effective_user
+    сообщение = update.message
+    
+    if чат.type == ChatType.PRIVATE:
+        return
+    
+    if not база.является_админом(chat.id, пользователь.id):
+        await update.message.reply_text("Нужны права")
+        return
+    
+    аргумент = контекст.args[0] if контекст.args else ""
+    результат = await разрешить_пользователя(аргумент, контекст, сообщение)
+    
+    if not результат:
+        await update.message.reply_text("Ответьте на сообщение или укажите ID")
+        return
+    
+    цель_id, цель_юзернейм = результат
+    
+    база.удалить_исключение(chat.id, цель_id)
+    отображение = f"@{цель_юзернейм}" if цель_юзернейм else f"ID {цель_id}"
+    await update.message.reply_text(f"✅ {отображение} удалён из исключений")
+
+async def команда_варн(update: Update, контекст: ContextTypes.DEFAULT_TYPE):
+    """!варн - выдать варн"""
+    чат = update.effective_chat
+    пользователь = update.effective_user
+    сообщение = update.message
+    
+    if чат.type == ChatType.PRIVATE:
+        return
+    
+    if not база.является_админом(chat.id, пользователь.id):
+        await update.message.reply_text("Нужны права")
+        return
+    
+    аргумент = контекст.args[0] if контекст.args else ""
+    результат = await разрешить_пользователя(аргумент, контекст, сообщение)
+    
+    if not результат:
+        await update.message.reply_text("Ответьте на сообщение или укажите ID")
+        return
+    
+    цель_id, цель_юзернейм = результат
+    
+    if await защищенный(chat.id, цель_id, контекст):
+        await update.message.reply_text("Пользователь защищён")
+        return
+    
+    база.добавить_варн(chat.id, цель_id)
+    варны = база.получить_варны(chat.id, цель_id)
+    настройки = база.получить_настройки(chat.id)
+    
+    отображение = f"@{цель_юзернейм}" if цель_юзернейм else f"ID {цель_id}"
+    await update.message.reply_text(f"⚠️ {отображение} варн {варны}/{настройки['варны_до_бана']}")
+    
+    if варны >= настройки['варны_до_бана']:
         try:
-            duration = int(context.args[0])
-            if duration < 1 or duration > 1440:
-                duration = 30
+            await контекст.bot.ban_chat_member(
+                chat_id=chat.id,
+                user_id=цель_id,
+                until_date=int((datetime.now() + timedelta(hours=2)).timestamp())
+            )
+            await update.message.reply_text(f"🚨 {отображение} забанен за варны")
+            база.очистить_варны(chat.id, цель_id)
+        except Exception as e:
+            логгер.error(f"Ошибка: {e}")
+
+async def команда_варны(update: Update, контекст: ContextTypes.DEFAULT_TYPE):
+    """!варны - посмотреть варны"""
+    чат = update.effective_chat
+    пользователь = update.effective_user
+    сообщение = update.message
+    
+    if чат.type == ChatType.PRIVATE:
+        return
+    
+    if not база.является_админом(chat.id, пользователь.id):
+        await update.message.reply_text("Нужны права")
+        return
+    
+    аргумент = контекст.args[0] if контекст.args else ""
+    
+    if not аргумент and not сообщение.reply_to_message:
+        варны = база.получить_варны(chat.id, пользователь.id)
+        await update.message.reply_text(f"Ваши варны: {варны}/2")
+        return
+    
+    результат = await разрешить_пользователя(аргумент, контекст, сообщение)
+    
+    if not результат:
+        await update.message.reply_text("Ответьте на сообщение или укажите ID")
+        return
+    
+    цель_id, цель_юзернейм = результат
+    варны = база.получить_варны(chat.id, цель_id)
+    
+    отображение = f"@{цель_юзернейм}" if цель_юзернейм else f"ID {цель_id}"
+    await update.message.reply_text(f"⚠️ {отображение} варн: {варны}/2")
+
+async def команда_снятьварны(update: Update, контекст: ContextTypes.DEFAULT_TYPE):
+    """!снятьварны - снять варны"""
+    чат = update.effective_chat
+    пользователь = update.effective_user
+    сообщение = update.message
+    
+    if чат.type == ChatType.PRIVATE:
+        return
+    
+    if not база.является_админом(chat.id, пользователь.id):
+        await update.message.reply_text("Нужны права")
+        return
+    
+    аргумент = контекст.args[0] if контекст.args else ""
+    результат = await разрешить_пользователя(аргумент, контекст, сообщение)
+    
+    if not результат:
+        await update.message.reply_text("Ответьте на сообщение или укажите ID")
+        return
+    
+    цель_id, цель_юзернейм = результат
+    
+    база.очистить_варны(chat.id, цель_id)
+    отображение = f"@{цель_юзернейм}" if цель_юзернейм else f"ID {цель_id}"
+    await update.message.reply_text(f"✅ {отображение} варны сняты")
+
+async def команда_админы(update: Update, контекст: ContextTypes.DEFAULT_TYPE):
+    """/админы - список админов"""
+    чат = update.effective_chat
+    
+    if чат.type == ChatType.PRIVATE:
+        await update.message.reply_text("В группе")
+        return
+    
+    админы = база.получить_админов(chat.id)
+    владелец = база.получить_владельца(chat.id)
+    
+    if not админы:
+        await update.message.reply_text("Нет админов")
+        return
+    
+    текст = "👑 Админы бота:\n\n"
+    
+    for юзер_id, юзернейм in админы:
+        if юзер_id == владелец:
+            отображение = f"@{юзернейм}" if юзернейм else f"ID {юзер_id}"
+            текст += f"• {отображение} 👑 (владелец)\n"
+        else:
+            отображение = f"@{юзернейм}" if юзернейм else f"ID {юзер_id}"
+            текст += f"• {отображение}\n"
+    
+    await update.message.reply_text(текст)
+
+async def команда_исключения(update: Update, контекст: ContextTypes.DEFAULT_TYPE):
+    """/исключения - список исключений"""
+    чат = update.effective_chat
+    
+    if чат.type == ChatType.PRIVATE:
+        await update.message.reply_text("В группе")
+        return
+    
+    исключения = база.получить_исключения(chat.id)
+    
+    if not исключения:
+        await update.message.reply_text("Нет исключений")
+        return
+    
+    текст = "👥 Исключения:\n\n"
+    for юзер_id, юзернейм in исключения:
+        отображение = f"@{юзернейм}" if юзернейм else f"ID {юзер_id}"
+        текст += f"• {отображение}\n"
+    
+    await update.message.reply_text(текст)
+
+async def команда_статус(update: Update, контекст: ContextTypes.DEFAULT_TYPE):
+    """/status - статус"""
+    чат = update.effective_chat
+    
+    if чат.type == ChatType.PRIVATE:
+        await update.message.reply_text("В группе")
+        return
+    
+    настройки = база.получить_настройки(chat.id)
+    
+    текст = f"""🛡️ Статус:
+
+📊 Лимиты:
+• Текст: {настройки['текст_лимит']}/{настройки['окно_времени']}сек
+• Медиа: {настройки['медиа_лимит']}/{настройки['окно_времени']}сек
+• Рейд: {настройки['порог_рейда']}/сек
+
+👥 Защита:
+• Исключения: {len(база.получить_исключения(chat.id))}
+• Админы бота: {len(база.получить_админов(chat.id))}
+• Владелец: {'✅' if база.получить_владельца(chat.id) else '❌'}
+
+📈 Активность: {база.получить_активность(chat.id, 60):.1f}/сек
+"""
+    
+    await update.message.reply_text(текст)
+
+async def команда_статистика(update: Update, контекст: ContextTypes.DEFAULT_TYPE):
+    """/stats - статистика"""
+    чат = update.effective_chat
+    
+    if чат.type == ChatType.PRIVATE:
+        await update.message.reply_text("В группе")
+        return
+    
+    настройки = база.получить_настройки(chat.id)
+    активность = база.получить_активность(chat.id, 300)
+    
+    текст = f"""📊 Статистика:
+
+📈 Активность (5 мин): {активность:.1f} сообщ/сек
+👥 Пользователи: {len(база.получить_исключения(chat.id))} исключений
+⚙️ Настройки: {настройки['текст_лимит']} текст, {настройки['медиа_лимит']} медиа
+"""
+    
+    await update.message.reply_text(текст)
+
+async def команда_логи(update: Update, контекст: ContextTypes.DEFAULT_TYPE):
+    """/logs - логи"""
+    чат = update.effective_chat
+    пользователь = update.effective_user
+    
+    if not база.является_админом(chat.id, пользователь.id):
+        await update.message.reply_text("Нужны права")
+        return
+    
+    логи = база.получить_логи(chat.id, 10)
+    
+    if not логи:
+        await update.message.reply_text("Нет логов")
+        return
+    
+    текст = "📝 Логи:\n\n"
+    for запись in логи:
+        время = datetime.fromtimestamp(запись['время']).strftime("%H:%M")
+        текст += f"• {время} {запись['действие']}"
+        if запись['цель_id']:
+            текст += f" (ID {запись['цель_id']})"
+        текст += "\n"
+    
+    await update.message.reply_text(текст)
+
+async def команда_блокировка(update: Update, контекст: ContextTypes.DEFAULT_TYPE):
+    """/lock - блокировка"""
+    чат = update.effective_chat
+    пользователь = update.effective_user
+    
+    if not база.является_админом(chat.id, пользователь.id):
+        await update.message.reply_text("Нужны права")
+        return
+    
+    try:
+        await контекст.bot.set_chat_permissions(
+            chat_id=chat.id,
+            permissions=ChatPermissions(can_send_messages=False)
+        )
+        await update.message.reply_text("🔒 Чат заблокирован")
+    except Exception as e:
+        await update.message.reply_text(f"Ошибка: {e}")
+
+async def команда_разблокировка(update: Update, контекст: ContextTypes.DEFAULT_TYPE):
+    """/unlock - разблокировка"""
+    чат = update.effective_chat
+    пользователь = update.effective_user
+    
+    if not база.является_админом(chat.id, пользователь.id):
+        await update.message.reply_text("Нужны права")
+        return
+    
+    try:
+        await контекст.bot.set_chat_permissions(
+            chat_id=chat.id,
+            permissions=ChatPermissions(can_send_messages=True)
+        )
+        await update.message.reply_text("🔓 Чат разблокирован")
+    except Exception as e:
+        await update.message.reply_text(f"Ошибка: {e}")
+
+async def команда_медленный(update: Update, контекст: ContextTypes.DEFAULT_TYPE):
+    """/slow - медленный режим"""
+    чат = update.effective_chat
+    пользователь = update.effective_user
+    
+    if not база.является_админом(chat.id, пользователь.id):
+        await update.message.reply_text("Нужны права")
+        return
+    
+    задержка = 15
+    if контекст.args:
+        try:
+            задержка = int(контекст.args[0])
+            if задержка < 0 or задержка > 21600:
+                задержка = 15
         except:
             pass
     
     try:
-        await context.bot.set_chat_permissions(
+        await контекст.bot.set_chat_permissions(
             chat_id=chat.id,
-            permissions=ChatPermissions(
-                can_send_messages=False,
-                can_send_other_messages=False,
-                can_add_web_page_previews=False,
-                can_change_info=False,
-                can_invite_users=False,
-                can_pin_messages=False
-            )
+            permissions=ChatPermissions(can_send_messages=True),
+            slow_mode_delay=задержка
         )
-        
-        db.log_action(chat.id, "manual_lockdown", user.id, reason=f"{duration} мин")
-        
-        await update.message.reply_text(f"🔒 Чат заблокирован на {duration} минут.")
+        await update.message.reply_text(f"🐢 Медленный режим: {задержка} сек")
     except Exception as e:
         await update.message.reply_text(f"Ошибка: {e}")
 
-async def unlock_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Разблокировка чата"""
-    chat = update.effective_chat
-    user = update.effective_user
+async def команда_нормальный(update: Update, контекст: ContextTypes.DEFAULT_TYPE):
+    """/normal - выключить медленный режим"""
+    чат = update.effective_chat
+    пользователь = update.effective_user
     
-    if not db.is_bot_admin(chat.id, user.id):
-        await update.message.reply_text("Требуются права админа бота.")
+    if not база.является_админом(chat.id, пользователь.id):
+        await update.message.reply_text("Нужны права")
         return
     
     try:
-        await context.bot.set_chat_permissions(
+        await контекст.bot.set_chat_permissions(
             chat_id=chat.id,
-            permissions=ChatPermissions(
-                can_send_messages=True,
-                can_send_other_messages=True,
-                can_add_web_page_previews=True,
-                can_change_info=False,
-                can_invite_users=True,
-                can_pin_messages=False
-            )
-        )
-        
-        await update.message.reply_text("🔓 Чат разблокирован.")
-    except Exception as e:
-        await update.message.reply_text(f"Ошибка: {e}")
-
-async def slow_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Включение медленного режима"""
-    chat = update.effective_chat
-    user = update.effective_user
-    
-    if not db.is_bot_admin(chat.id, user.id):
-        await update.message.reply_text("Требуются права админа бота.")
-        return
-    
-    delay = 15
-    if context.args:
-        try:
-            delay = int(context.args[0])
-            if delay < 0 or delay > 21600:
-                delay = 15
-        except:
-            pass
-    
-    try:
-        await context.bot.set_chat_permissions(
-            chat_id=chat.id,
-            permissions=ChatPermissions(
-                can_send_messages=True,
-                can_send_other_messages=True
-            ),
-            slow_mode_delay=delay
-        )
-        
-        db.log_action(chat.id, "slowmode", user.id, reason=f"{delay} сек")
-        
-        await update.message.reply_text(f"🐢 Медленный режим: {delay} секунд.")
-    except Exception as e:
-        await update.message.reply_text(f"Ошибка: {e}")
-
-async def normal_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Выключение медленного режима"""
-    chat = update.effective_chat
-    user = update.effective_user
-    
-    if not db.is_bot_admin(chat.id, user.id):
-        await update.message.reply_text("Требуются права админа бота.")
-        return
-    
-    try:
-        await context.bot.set_chat_permissions(
-            chat_id=chat.id,
-            permissions=ChatPermissions(
-                can_send_messages=True,
-                can_send_other_messages=True
-            ),
+            permissions=ChatPermissions(can_send_messages=True),
             slow_mode_delay=0
         )
-        
-        await update.message.reply_text("🚀 Медленный режим выключен.")
+        await update.message.reply_text("🚀 Медленный режим выключен")
     except Exception as e:
         await update.message.reply_text(f"Ошибка: {e}")
 
-# ============ КОМАНДЫ ИСКЛЮЧЕНИЙ ============
+# ============ КНОПКИ ============
 
-async def exempt_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Добавить исключение"""
-    chat = update.effective_chat
-    user = update.effective_user
+async def обработчик_кнопок(update: Update, контекст: ContextTypes.DEFAULT_TYPE):
+    запрос = update.callback_query
+    await запрос.answer()
     
-    if not db.is_bot_admin(chat.id, user.id):
-        await update.message.reply_text("Требуются права админа бота.")
+    данные = запрос.data
+    chat_id = запрос.message.chat.id
+    user_id = запрос.from_user.id
+    
+    if not база.является_админом(chat_id, user_id):
+        await запрос.edit_message_text("Нужны права")
         return
     
-    if not context.args:
-        await update.message.reply_text("Использование: /exempt <username или ID>")
-        return
+    настройки = база.получить_настройки(chat_id)
     
-    identifier = context.args[0]
+    if данные == "меню_флуд":
+        клавиатура = [
+            [InlineKeyboardButton(f"Текст: {настройки['текст_лимит']}", callback_data="уст_текст")],
+            [InlineKeyboardButton(f"Медиа: {настройки['медиа_лимит']}", callback_data="уст_медиа")],
+            [InlineKeyboardButton(f"Окно: {настройки['окно_времени']} сек", callback_data="уст_окно")],
+            [InlineKeyboardButton(f"Строгий: {'✅' if настройки['строгий_режим'] else '❌'}", callback_data="тог_строгий")],
+            [InlineKeyboardButton("⬅️ Назад", callback_data="назад")]
+        ]
+        await запрос.edit_message_text("📊 Анти-флуд:", reply_markup=InlineKeyboardMarkup(клавиатура))
     
-    # Разрешаем идентификатор
-    result = await resolve_user_identifier(identifier, context, chat.id)
+    elif данные == "меню_рейд":
+        клавиатура = [
+            [InlineKeyboardButton(f"Порог: {настройки['порог_рейда']}/сек", callback_data="уст_порог")],
+            [InlineKeyboardButton(f"Окно: {настройки['окно_рейда']} сек", callback_data="уст_окно_рейд")],
+            [InlineKeyboardButton(f"Блокировка: {настройки['блокировка_время']} м", callback_data="уст_блок")],
+            [InlineKeyboardButton(f"Auto: {'✅' if настройки['авто_блокировка'] else '❌'}", callback_data="тог_авто")],
+            [InlineKeyboardButton("⬅️ Назад", callback_data="назад")]
+        ]
+        await запрос.edit_message_text("🛡️ Анти-рейд:", reply_markup=InlineKeyboardMarkup(клавиатура))
     
-    if not result:
-        await update.message.reply_text("Пользователь не найден.")
-        return
+    elif данные == "меню_настройки":
+        клавиатура = [
+            [InlineKeyboardButton(f"Бан: {настройки['бан_часы']} ч", callback_data="уст_бан")],
+            [InlineKeyboardButton(f"Мут: {настройки['мут_минуты']} м", callback_data="уст_мут")],
+            [InlineKeyboardButton(f"Варны: {настройки['варны_до_бана']}", callback_data="уст_варны")],
+            [InlineKeyboardButton("⬅️ Назад", callback_data="назад")]
+        ]
+        await запрос.edit_message_text("⚙️ Наказания:", reply_markup=InlineKeyboardMarkup(клавиатура))
     
-    target_id, target_username = result
+    elif данные == "меню_исключения":
+        count = len(база.получить_исключения(chat_id))
+        клавиатура = [
+            [InlineKeyboardButton("➕ Добавить", callback_data="доб_искл")],
+            [InlineKeyboardButton("➖ Удалить", callback_data="уд_искл")],
+            [InlineKeyboardButton(f"📋 Список ({count})", callback_data="список_искл")],
+            [InlineKeyboardButton("⬅️ Назад", callback_data="назад")]
+        ]
+        await запрос.edit_message_text("👥 Исключения:", reply_markup=InlineKeyboardMarkup(клавиатура))
     
-    # Нельзя добавить самого себя
-    if target_id == user.id:
-        await update.message.reply_text("Нельзя добавить самого себя.")
-        return
+    elif данные == "меню_админы":
+        count = len(база.получить_админов(chat_id))
+        клавиатура = [
+            [InlineKeyboardButton("➕ Добавить", callback_data="доб_адм")],
+            [InlineKeyboardButton("➖ Удалить", callback_data="уд_адм")],
+            [InlineKeyboardButton(f"📋 Список ({count})", callback_data="список_адм")],
+            [InlineKeyboardButton("⬅️ Назад", callback_data="назад")]
+        ]
+        await запрос.edit_message_text("👑 Админы:", reply_markup=InlineKeyboardMarkup(клавиатура))
     
-    # Нельзя добавить бота
-    bot_info = await context.bot.get_me()
-    if target_id == bot_info.id:
-        await update.message.reply_text("Нельзя добавить бота.")
-        return
-    
-    # Добавляем исключение
-    if db.add_exempt_user(chat.id, target_id, user.id, target_username, "manual"):
-        # Кэшируем username
-        if target_username:
-            db.cache_user(target_username, target_id)
-        
-        display_name = f"@{target_username}" if target_username else f"ID {target_id}"
-        await update.message.reply_text(f"✅ {display_name} добавлен в исключения.")
-    else:
-        await update.message.reply_text("Ошибка добавления.")
+    elif данные == "меню_статистика":
+        активность = база.получить_активность(chat_id, 60)
+        текст = f"""📊 Статистика:
 
-async def unexempt_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Удалить исключение"""
-    chat = update.effective_chat
-    user = update.effective_user
-    
-    if not db.is_bot_admin(chat.id, user.id):
-        await update.message.reply_text("Требуются права админа бота.")
-        return
-    
-    if not context.args:
-        await update.message.reply_text("Использование: /unexempt <username или ID>")
-        return
-    
-    identifier = context.args[0]
-    
-    # Разрешаем идентификатор
-    result = await resolve_user_identifier(identifier, context, chat.id)
-    
-    if not result:
-        await update.message.reply_text("Пользователь не найден.")
-        return
-    
-    target_id, target_username = result
-    
-    # Удаляем исключение
-    if db.remove_exempt_user(chat.id, target_id):
-        display_name = f"@{target_username}" if target_username else f"ID {target_id}"
-        await update.message.reply_text(f"✅ {display_name} удалён из исключений.")
-    else:
-        await update.message.reply_text("Пользователь не найден в исключениях.")
-
-async def exemptlist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Список исключений"""
-    chat = update.effective_chat
-    
-    exempt_users = db.get_exempt_users(chat.id)
-    
-    if not exempt_users:
-        await update.message.reply_text("Нет исключённых пользователей.")
-        return
-    
-    text = "👥 Исключённые пользователи:\n\n"
-    for i, (user_id, username) in enumerate(exempt_users, 1):
-        display = f"@{username}" if username else f"ID {user_id}"
-        text += f"{i}. {display}\n"
-    
-    await update.message.reply_text(text)
-
-# ============ КОМАНДЫ АДМИНИСТРИРОВАНИЯ ============
-
-async def promote_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Добавить админа бота"""
-    chat = update.effective_chat
-    user = update.effective_user
-    
-    # Только владелец может добавлять админов
-    owner = db.get_chat_owner(chat.id)
-    if user.id != owner:
-        await update.message.reply_text("Только владелец может добавлять админов.")
-        return
-    
-    if not context.args:
-        await update.message.reply_text("Использование: /promote <username или ID>")
-        return
-    
-    identifier = context.args[0]
-    
-    # Разрешаем идентификатор
-    result = await resolve_user_identifier(identifier, context, chat.id)
-    
-    if not result:
-        await update.message.reply_text("Пользователь не найден.")
-        return
-    
-    target_id, target_username = result
-    
-    # Нельзя добавить самого себя
-    if target_id == user.id:
-        await update.message.reply_text("Вы уже владелец.")
-        return
-    
-    # Нельзя добавить бота
-    bot_info = await context.bot.get_me()
-    if target_id == bot_info.id:
-        await update.message.reply_text("Нельзя добавить бота.")
-        return
-    
-    # Добавляем админа
-    if db.add_bot_admin(chat.id, target_id, user.id, target_username):
-        # Кэшируем username
-        if target_username:
-            db.cache_user(target_username, target_id)
-        
-        display_name = f"@{target_username}" if target_username else f"ID {target_id}"
-        await update.message.reply_text(f"✅ {display_name} добавлен в админы бота.")
-    else:
-        await update.message.reply_text("Ошибка или уже админ.")
-
-async def demote_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Удалить админа бота"""
-    chat = update.effective_chat
-    user = update.effective_user
-    
-    # Только владелец может удалять админов
-    owner = db.get_chat_owner(chat.id)
-    if user.id != owner:
-        await update.message.reply_text("Только владелец может удалять админов.")
-        return
-    
-    if not context.args:
-        await update.message.reply_text("Использование: /demote <username или ID>")
-        return
-    
-    identifier = context.args[0]
-    
-    # Разрешаем идентификатор
-    result = await resolve_user_identifier(identifier, context, chat.id)
-    
-    if not result:
-        await update.message.reply_text("Пользователь не найден.")
-        return
-    
-    target_id, target_username = result
-    
-    # Нельзя удалить владельца
-    if target_id == owner:
-        await update.message.reply_text("Нельзя удалить владельца.")
-        return
-    
-    # Удаляем админа
-    if db.remove_bot_admin(chat.id, target_id):
-        display_name = f"@{target_username}" if target_username else f"ID {target_id}"
-        await update.message.reply_text(f"✅ {display_name} удалён из админов бота.")
-    else:
-        await update.message.reply_text("Пользователь не найден в админах.")
-
-async def admins_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Список админов бота"""
-    chat = update.effective_chat
-    
-    bot_admins = db.get_bot_admins(chat.id)
-    owner = db.get_chat_owner(chat.id)
-    
-    if not bot_admins and not owner:
-        await update.message.reply_text("Нет админов бота.")
-        return
-    
-    text = "👑 Админы бота:\n\n"
-    
-    if owner:
-        # Находим username владельца
-        owner_name = "Владелец"
-        for admin_id, username in bot_admins:
-            if admin_id == owner:
-                owner_name = f"@{username}" if username else f"ID {owner}"
-                break
-        
-        text += f"👑 {owner_name} (владелец)\n\n"
-    
-    # Остальные админы
-    admin_count = 0
-    for admin_id, username in bot_admins:
-        if admin_id != owner:  # Пропускаем владельца
-            admin_count += 1
-            display = f"@{username}" if username else f"ID {admin_id}"
-            text += f"{admin_count}. {display}\n"
-    
-    if admin_count == 0 and owner:
-        text += "Других админов нет"
-    
-    await update.message.reply_text(text)
-
-# ============ КОМАНДЫ СТАТИСТИКИ ============
-
-async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Статистика чата"""
-    chat = update.effective_chat
-    
-    config = db.get_chat_config(chat.id)
-    
-    # Активность за разные периоды
-    activity_1m = db.get_chat_activity(chat.id, 60)
-    activity_5m = db.get_chat_activity(chat.id, 300)
-    activity_15m = db.get_chat_activity(chat.id, 900)
-    
-    text = f"""📊 Статистика защиты:
-
-📈 Активность:
-• 1 минута: {activity_1m:.1f} сообщ/сек
-• 5 минут: {activity_5m:.1f} сообщ/сек
-• 15 минут: {activity_15m:.1f} сообщ/сек
-
-👥 Пользователи:
-• Исключения: {len(db.get_exempt_users(chat.id))}
-• Админы бота: {len(db.get_bot_admins(chat.id))}
-• Владелец: {'Установлен' if db.get_chat_owner(chat.id) else 'Нет'}
-
-⚙️ Настройки:
-• Лимит текста: {config['text_limit']}/{config['time_window']}сек
-• Лимит медиа: {config['media_limit']}/{config['time_window']}сек
-• Порог рейда: {config['raid_threshold']}/сек
+📈 Активность: {активность:.1f} сообщ/сек
+👥 Исключения: {len(база.получить_исключения(chat_id))}
+👑 Админы: {len(база.получить_админов(chat_id))}
 """
+        клавиатура = [[InlineKeyboardButton("⬅️ Назад", callback_data="назад")]]
+        await запрос.edit_message_text(текст, reply_markup=InlineKeyboardMarkup(клавиатура))
     
-    await update.message.reply_text(text)
-
-async def logs_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Последние действия"""
-    chat = update.effective_chat
-    user = update.effective_user
-    
-    if not db.is_bot_admin(chat.id, user.id):
-        await update.message.reply_text("Требуются права админа бота.")
-        return
-    
-    recent_actions = db.get_recent_actions(chat.id, 10)
-    
-    if not recent_actions:
-        await update.message.reply_text("Нет записей о действиях.")
-        return
-    
-    text = "📝 Последние действия:\n\n"
-    
-    for action in recent_actions:
-        timestamp = datetime.fromtimestamp(action['timestamp'])
-        time_str = timestamp.strftime("%H:%M:%S")
-        
-        target = ""
-        if action['target_username']:
-            target = f"@{action['target_username']}"
-        elif action['target_id']:
-            target = f"ID {action['target_id']}"
-        
-        reason = f" - {action['reason']}" if action['reason'] else ""
-        
-        text += f"• {time_str} {action['action'].upper()}"
-        if target:
-            text += f" {target}"
-        text += f"{reason}\n"
-    
-    await update.message.reply_text(text)
-
-async def warnings_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Предупреждения пользователя"""
-    chat = update.effective_chat
-    user = update.effective_user
-    
-    if not db.is_bot_admin(chat.id, user.id):
-        await update.message.reply_text("Требуются права админа бота.")
-        return
-    
-    if not context.args:
-        # Показываем свои предупреждения
-        count = db.get_warning_count(chat.id, user.id)
-        config = db.get_chat_config(chat.id)
-        max_warnings = 2
-        
-        await update.message.reply_text(
-            f"⚠️ Ваши предупреждения: {count}/{max_warnings}\n"
-            f"Сбрасываются через {config.get('warning_reset_hours', 6)} часов."
-        )
-        return
-    
-    # Показываем предупреждения другого пользователя
-    identifier = context.args[0]
-    
-    result = await resolve_user_identifier(identifier, context, chat.id)
-    
-    if not result:
-        await update.message.reply_text("Пользователь не найден.")
-        return
-    
-    target_id, target_username = result
-    count = db.get_warning_count(chat.id, target_id)
-    
-    display = f"@{target_username}" if target_username else f"ID {target_id}"
-    await update.message.reply_text(
-        f"⚠️ Предупреждения {display}: {count}/2\n"
-        "После 2 предупреждений - бан/мут."
-    )
-
-# ============ ИНЛАЙН МЕНЮ ============
-
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик инлайн-кнопок"""
-    query = update.callback_query
-    await query.answer()
-    
-    data = query.data
-    chat_id = query.message.chat.id
-    user_id = query.from_user.id
-    
-    if not db.is_bot_admin(chat_id, user_id):
-        await query.edit_message_text("Требуются права админа бота.")
-        return
-    
-    config = db.get_chat_config(chat_id)
-    
-    if data == "menu_flood":
-        keyboard = [
-            [InlineKeyboardButton(f"Текст: {config['text_limit']}", callback_data="set_text_limit")],
-            [InlineKeyboardButton(f"Медиа: {config['media_limit']}", callback_data="set_media_limit")],
-            [InlineKeyboardButton(f"Окно: {config['time_window']} сек", callback_data="set_time_window")],
-            [InlineKeyboardButton(f"Строгий режим: {'✅' if config['strict_mode'] else '❌'}", 
-                                 callback_data="toggle_strict")],
-            [InlineKeyboardButton("⬅️ Назад", callback_data="back_main")]
+    elif данные == "назад":
+        клавиатура = [
+            [InlineKeyboardButton("📊 Анти-флуд", callback_data="меню_флуд")],
+            [InlineKeyboardButton("🛡️ Анти-рейд", callback_data="меню_рейд")],
+            [InlineKeyboardButton("⚙️ Настройки", callback_data="меню_настройки")],
+            [InlineKeyboardButton("👥 Исключения", callback_data="меню_исключения")],
+            [InlineKeyboardButton("👑 Админы", callback_data="меню_админы")],
+            [InlineKeyboardButton("📊 Статистика", callback_data="меню_статистика")]
         ]
+        await запрос.edit_message_text("⚙️ Панель:", reply_markup=InlineKeyboardMarkup(клавиатура))
+    
+    elif данные.startswith("тог_"):
+        if данные == "тог_строгий":
+            настройки["строгий_режим"] = not настройки["строгий_режим"]
+        elif данные == "тог_авто":
+            настройки["авто_блокировка"] = not настройки["авто_блокировка"]
         
-        await query.edit_message_text(
-            "📊 Настройка анти-флуда:",
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
+        база.сохранить_настройки(chat_id, настройки)
+        await обработчик_кнопок(update, контекст)
     
-    elif data == "menu_raid":
-        keyboard = [
-            [InlineKeyboardButton(f"Порог: {config['raid_threshold']}/сек", callback_data="set_raid_threshold")],
-            [InlineKeyboardButton(f"Окно: {config['raid_window']} сек", callback_data="set_raid_window")],
-            [InlineKeyboardButton(f"Блокировка: {config['lockdown_duration']} мин", 
-                                 callback_data="set_lockdown_duration")],
-            [InlineKeyboardButton(f"Auto-Lockdown: {'✅' if config['auto_lockdown'] else '❌'}", 
-                                 callback_data="toggle_lockdown")],
-            [InlineKeyboardButton("⬅️ Назад", callback_data="back_main")]
-        ]
-        
-        await query.edit_message_text(
-            "🛡️ Настройка анти-рейда:",
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
-    
-    elif data == "menu_settings":
-        keyboard = [
-            [InlineKeyboardButton(f"Бан: {config['ban_duration']} ч", callback_data="set_ban_duration")],
-            [InlineKeyboardButton(f"Мут: {config['mute_duration']} м", callback_data="set_mute_duration")],
-            [InlineKeyboardButton(f"Auto-Slowmode: {'✅' if config['auto_slowmode'] else '❌'}", 
-                                 callback_data="toggle_slowmode")],
-            [InlineKeyboardButton(f"Задержка: {config['slowmode_delay']} сек", callback_data="set_slowmode_delay")],
-            [InlineKeyboardButton("⬅️ Назад", callback_data="back_main")]
-        ]
-        
-        await query.edit_message_text(
-            "⚙️ Дополнительные настройки:",
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
-    
-    elif data == "menu_exempt":
-        exempt_count = len(db.get_exempt_users(chat_id))
-        keyboard = [
-            [InlineKeyboardButton("➕ Добавить исключение", callback_data="add_exempt")],
-            [InlineKeyboardButton("➖ Удалить исключение", callback_data="remove_exempt")],
-            [InlineKeyboardButton(f"📋 Список ({exempt_count})", callback_data="list_exempt_menu")],
-            [InlineKeyboardButton("⬅️ Назад", callback_data="back_main")]
-        ]
-        
-        await query.edit_message_text(
-            "👥 Управление исключениями:",
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
-    
-    elif data == "menu_admins":
-        admins_count = len(db.get_bot_admins(chat_id))
-        keyboard = [
-            [InlineKeyboardButton("➕ Добавить админа", callback_data="add_admin")],
-            [InlineKeyboardButton("➖ Удалить админа", callback_data="remove_admin")],
-            [InlineKeyboardButton(f"📋 Список ({admins_count})", callback_data="list_admins_menu")],
-            [InlineKeyboardButton("⬅️ Назад", callback_data="back_main")]
-        ]
-        
-        await query.edit_message_text(
-            "👑 Управление админами бота:",
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
-    
-    elif data == "menu_stats":
-        await stats_cmd(query, context)
-        return
-    
-    elif data == "back_main":
-        keyboard = [
-            [InlineKeyboardButton("📊 Анти-флуд", callback_data="menu_flood")],
-            [InlineKeyboardButton("🛡️ Анти-рейд", callback_data="menu_raid")],
-            [InlineKeyboardButton("⚙️ Настройки", callback_data="menu_settings")],
-            [InlineKeyboardButton("👥 Исключения", callback_data="menu_exempt")],
-            [InlineKeyboardButton("👑 Админы", callback_data="menu_admins")],
-            [InlineKeyboardButton("📊 Статистика", callback_data="menu_stats")]
-        ]
-        
-        await query.edit_message_text(
-            "⚙️ Панель управления защитой\nВыберите раздел:",
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
-    
-    elif data.startswith("toggle_"):
-        # Обработка переключателей
-        toggle_map = {
-            "toggle_strict": "strict_mode",
-            "toggle_lockdown": "auto_lockdown",
-            "toggle_slowmode": "auto_slowmode"
+    elif данные.startswith("уст_"):
+        параметры = {
+            "уст_текст": ("текст_лимит", "Введите лимит текста (1-20):"),
+            "уст_медиа": ("медиа_лимит", "Введите лимит медиа (1-20):"),
+            "уст_окно": ("окно_времени", "Введите окно (1-60 сек):"),
+            "уст_порог": ("порог_рейда", "Введите порог рейда (1-50):"),
+            "уст_окно_рейд": ("окно_рейда", "Введите окно рейда (1-10 сек):"),
+            "уст_блок": ("блокировка_время", "Введите блокировку (1-1440 мин):"),
+            "уст_бан": ("бан_часы", "Введите часы бана (0-744):"),
+            "уст_мут": ("мут_минуты", "Введите минуты мута (1-10080):"),
+            "уст_варны": ("варны_до_бана", "Введите варны до бана (1-10):"),
         }
         
-        if data in toggle_map:
-            param = toggle_map[data]
-            config[param] = not config[param]
-            db.save_chat_config(chat_id, config)
-            
-            await query.answer(f"{param} изменён")
-            await button_handler(update, context)  # Обновляем меню
+        if данные in параметры:
+            параметр, вопрос = параметры[данные]
+            контекст.user_data["параметр"] = параметр
+            контекст.user_data["чат"] = chat_id
+            await запрос.edit_message_text(f"{question}\n\nОтправьте число в чат.")
     
-    elif data.startswith("set_"):
-        # Обработка установки значений
-        param_map = {
-            "set_text_limit": ("text_limit", "Введите лимит текстовых сообщений (1-20):"),
-            "set_media_limit": ("media_limit", "Введите лимит медиа сообщений (1-20):"),
-            "set_time_window": ("time_window", "Введите временное окно в секундах (1-60):"),
-            "set_raid_threshold": ("raid_threshold", "Введите порог рейда (1-50):"),
-            "set_raid_window": ("raid_window", "Введите окно анализа рейда (1-10):"),
-            "set_lockdown_duration": ("lockdown_duration", "Введите длительность блокировки (1-1440 мин):"),
-            "set_ban_duration": ("ban_duration", "Введите длительность бана (0-744 часов):"),
-            "set_mute_duration": ("mute_duration", "Введите длительность мута (1-10080 минут):"),
-            "set_slowmode_delay": ("slowmode_delay", "Введите задержку медленного режима (0-21600 сек):")
-        }
-        
-        if data in param_map:
-            param_name, prompt = param_map[data]
-            context.user_data["waiting_param"] = param_name
-            context.user_data["waiting_chat"] = chat_id
-            
-            await query.edit_message_text(
-                f"{prompt}\n\nОтправьте число в чат.",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("❌ Отмена", callback_data="back_main")]
-                ])
-            )
-    
-    elif data == "list_exempt_menu":
-        exempt_users = db.get_exempt_users(chat_id)
-        
-        if not exempt_users:
-            text = "Нет исключённых пользователей."
+    elif данные == "список_искл":
+        исключения = база.получить_исключения(chat_id)
+        if исключения:
+            текст = "👥 Исключения:\n\n"
+            for юзер_id, юзернейм in исключения:
+                отображение = f"@{юзернейм}" if юзернейм else f"ID {юзер_id}"
+                текст += f"• {отображение}\n"
         else:
-            text = "👥 Исключённые пользователи:\n\n"
-            for i, (user_id, username) in enumerate(exempt_users, 1):
-                display = f"@{username}" if username else f"ID {user_id}"
-                text += f"{i}. {display}\n"
-        
-        await query.edit_message_text(
-            text,
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("⬅️ Назад", callback_data="menu_exempt")]
-            ])
-        )
+            текст = "Нет исключений"
+        клавиатура = [[InlineKeyboardButton("⬅️ Назад", callback_data="меню_исключения")]]
+        await запрос.edit_message_text(текст, reply_markup=InlineKeyboardMarkup(клавиатура))
     
-    elif data == "list_admins_menu":
-        bot_admins = db.get_bot_admins(chat_id)
-        owner = db.get_chat_owner(chat_id)
-        
-        if not bot_admins and not owner:
-            text = "Нет админов бота."
+    elif данные == "список_адм":
+        админы = база.получить_админов(chat_id)
+        владелец = база.получить_владельца(chat_id)
+        if админы:
+            текст = "👑 Админы:\n\n"
+            for юзер_id, юзернейм in админы:
+                if юзер_id == владелец:
+                    отображение = f"@{юзернейм}" if юзернейм else f"ID {юзер_id}"
+                    текст += f"• {отображение} 👑\n"
+                else:
+                    отображение = f"@{юзернейм}" if юзернейм else f"ID {юзер_id}"
+                    текст += f"• {отображение}\n"
         else:
-            text = "👑 Админы бота:\n\n"
-            
-            if owner:
-                owner_name = "Владелец"
-                for admin_id, username in bot_admins:
-                    if admin_id == owner:
-                        owner_name = f"@{username}" if username else f"ID {owner}"
-                        break
-                
-                text += f"👑 {owner_name} (владелец)\n\n"
-            
-            admin_count = 0
-            for admin_id, username in bot_admins:
-                if admin_id != owner:
-                    admin_count += 1
-                    display = f"@{username}" if username else f"ID {admin_id}"
-                    text += f"{admin_count}. {display}\n"
-            
-            if admin_count == 0 and owner:
-                text += "Других админов нет"
-        
-        await query.edit_message_text(
-            text,
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("⬅️ Назад", callback_data="menu_admins")]
-            ])
-        )
+            текст = "Нет админов"
+        клавиатура = [[InlineKeyboardButton("⬅️ Назад", callback_data="меню_админы")]]
+        await запрос.edit_message_text(текст, reply_markup=InlineKeyboardMarkup(клавиатура))
 
-async def param_input_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик ввода параметров"""
-    if "waiting_param" not in context.user_data:
+async def обработчик_ввода(update: Update, контекст: ContextTypes.DEFAULT_TYPE):
+    if "параметр" not in контекст.user_data:
         return
     
-    param_name = context.user_data["waiting_param"]
-    chat_id = context.user_data.get("waiting_chat")
+    параметр = контекст.user_data["параметр"]
+    chat_id = контекст.user_data.get("чат")
     
     if not chat_id or chat_id != update.effective_chat.id:
         return
     
-    if not db.is_bot_admin(chat_id, update.effective_user.id):
-        await update.message.reply_text("Нет прав.")
+    if not база.является_админом(chat_id, update.effective_user.id):
+        await update.message.reply_text("Нужны права")
         return
     
     try:
-        value = int(update.message.text)
+        значение = int(update.message.text)
         
-        # Валидация значений
+        # Валидация
         limits = {
-            "text_limit": (1, 20),
-            "media_limit": (1, 20),
-            "time_window": (1, 60),
-            "raid_threshold": (1, 50),
-            "raid_window": (1, 10),
-            "lockdown_duration": (1, 1440),
-            "ban_duration": (0, 744),
-            "mute_duration": (1, 10080),
-            "slowmode_delay": (0, 21600)
+            "текст_лимит": (1, 20),
+            "медиа_лимит": (1, 20),
+            "окно_времени": (1, 60),
+            "порог_рейда": (1, 50),
+            "окно_рейда": (1, 10),
+            "блокировка_время": (1, 1440),
+            "бан_часы": (0, 744),
+            "мут_минуты": (1, 10080),
+            "варны_до_бана": (1, 10),
         }
         
-        if param_name in limits:
-            min_val, max_val = limits[param_name]
-            if value < min_val or value > max_val:
-                await update.message.reply_text(f"От {min_val} до {max_val}")
+        if параметр in limits:
+            мин, макс = limits[параметр]
+            if значение < мин or значение > макс:
+                await update.message.reply_text(f"От {мин} до {макс}")
                 return
         
-        # Сохраняем значение
-        config = db.get_chat_config(chat_id)
-        config[param_name] = value
-        db.save_chat_config(chat_id, config)
+        настройки = база.получить_настройки(chat_id)
+        настройки[параметр] = значение
+        база.сохранить_настройки(chat_id, настройки)
         
-        # Показываем сообщение об успехе
-        await update.message.reply_text(f"✅ {param_name} установлен: {value}")
+        await update.message.reply_text(f"✅ Установлено: {значение}")
         
-        # Очищаем состояние
-        del context.user_data["waiting_param"]
-        del context.user_data["waiting_chat"]
+        del контекст.user_data["параметр"]
+        del контекст.user_data["чат"]
         
     except ValueError:
-        await update.message.reply_text("Введите число.")
+        await update.message.reply_text("Введите число")
 
 # ============ ВЕБ-СЕРВЕР ============
 
@@ -1644,12 +1273,8 @@ class WebHandler(BaseHTTPRequestHandler):
             self.send_header("Content-type", "text/html; charset=utf-8")
             self.end_headers()
             
-            stats = db.get_stats()
+            stats = база.получить_статистику_бота()
             uptime = datetime.now() - start_time
-            
-            days = uptime.days
-            hours = uptime.seconds // 3600
-            minutes = (uptime.seconds % 3600) // 60
             
             html = f"""
             <!DOCTYPE html>
@@ -1659,226 +1284,84 @@ class WebHandler(BaseHTTPRequestHandler):
                 <meta name="viewport" content="width=device-width, initial-scale=1.0">
                 <title>Anti-Raid Bot</title>
                 <style>
-                    * {{
-                        margin: 0;
-                        padding: 0;
-                        box-sizing: border-box;
-                    }}
-                    
                     body {{
-                        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-                        background: #0a0a0a;
-                        color: #f0f0f0;
-                        line-height: 1.6;
-                        min-height: 100vh;
+                        font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+                        background: #000;
+                        color: #fff;
+                        margin: 0;
+                        padding: 20px;
                     }}
-                    
                     .container {{
                         max-width: 800px;
                         margin: 0 auto;
-                        padding: 40px 20px;
                     }}
-                    
                     header {{
                         text-align: center;
-                        margin-bottom: 50px;
-                        padding-bottom: 30px;
+                        margin-bottom: 40px;
                         border-bottom: 1px solid #333;
+                        padding-bottom: 20px;
                     }}
-                    
                     h1 {{
-                        font-size: 2.8em;
-                        font-weight: 300;
-                        letter-spacing: 2px;
-                        margin-bottom: 10px;
+                        font-size: 2.5em;
+                        margin: 0;
                     }}
-                    
-                    .subtitle {{
-                        color: #888;
-                        font-size: 1.1em;
-                        margin-bottom: 30px;
-                    }}
-                    
                     .status {{
                         display: inline-block;
-                        padding: 8px 20px;
-                        background: #222;
-                        border: 1px solid #444;
-                        border-radius: 20px;
-                        font-size: 0.9em;
-                        color: #4CAF50;
+                        padding: 5px 15px;
+                        background: #0a0;
+                        border-radius: 15px;
+                        margin: 10px 0;
                     }}
-                    
-                    .stats-grid {{
+                    .stats {{
                         display: grid;
-                        grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+                        grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
                         gap: 20px;
-                        margin: 40px 0;
+                        margin: 30px 0;
                     }}
-                    
-                    .stat-card {{
+                    .stat {{
                         background: #111;
-                        border: 1px solid #222;
-                        border-radius: 8px;
-                        padding: 25px;
+                        padding: 20px;
+                        border-radius: 10px;
                         text-align: center;
-                        transition: transform 0.2s;
                     }}
-                    
-                    .stat-card:hover {{
-                        transform: translateY(-2px);
-                        border-color: #333;
-                    }}
-                    
                     .stat-number {{
-                        font-size: 2.2em;
-                        font-weight: 300;
-                        color: #fff;
-                        margin-bottom: 5px;
+                        font-size: 2em;
+                        font-weight: bold;
                     }}
-                    
-                    .stat-label {{
-                        color: #888;
-                        font-size: 0.9em;
-                    }}
-                    
                     .section {{
                         background: #111;
-                        border: 1px solid #222;
-                        border-radius: 8px;
                         padding: 30px;
+                        border-radius: 10px;
                         margin-bottom: 30px;
                     }}
-                    
-                    .section-title {{
-                        font-size: 1.4em;
-                        font-weight: 400;
-                        margin-bottom: 20px;
-                        color: #fff;
-                        padding-bottom: 10px;
-                        border-bottom: 1px solid #333;
+                    h2 {{
+                        margin-top: 0;
                     }}
-                    
                     .features {{
                         display: grid;
-                        grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+                        grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
                         gap: 15px;
+                        margin-top: 20px;
                     }}
-                    
                     .feature {{
-                        background: #0a0a0a;
-                        padding: 20px;
-                        border-radius: 6px;
-                        border-left: 3px solid #444;
+                        background: #222;
+                        padding: 15px;
+                        border-radius: 8px;
                     }}
-                    
-                    .feature-title {{
-                        color: #fff;
-                        margin-bottom: 10px;
-                        font-weight: 500;
-                    }}
-                    
-                    .feature-desc {{
-                        color: #888;
-                        font-size: 0.9em;
-                    }}
-                    
-                    .commands {{
-                        display: grid;
-                        grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
-                        gap: 20px;
-                    }}
-                    
-                    .command-group {{
-                        background: #0a0a0a;
-                        padding: 20px;
-                        border-radius: 6px;
-                    }}
-                    
-                    .group-title {{
-                        color: #fff;
-                        margin-bottom: 15px;
-                        font-weight: 500;
-                    }}
-                    
-                    .command {{
-                        margin-bottom: 12px;
-                        padding-left: 15px;
-                        border-left: 2px solid #333;
-                    }}
-                    
-                    .cmd {{
-                        color: #fff;
-                        font-family: 'Courier New', monospace;
-                        font-size: 0.9em;
-                        margin-bottom: 5px;
-                    }}
-                    
-                    .desc {{
-                        color: #888;
-                        font-size: 0.85em;
-                    }}
-                    
-                    .terms {{
-                        color: #aaa;
-                        line-height: 1.8;
-                    }}
-                    
-                    .terms h3 {{
-                        color: #fff;
-                        margin: 25px 0 15px 0;
-                        font-weight: 400;
-                    }}
-                    
-                    .terms ul {{
-                        margin-left: 20px;
-                        margin-bottom: 20px;
-                    }}
-                    
-                    .terms li {{
-                        margin-bottom: 8px;
-                    }}
-                    
                     footer {{
                         text-align: center;
-                        margin-top: 50px;
-                        padding-top: 30px;
+                        margin-top: 40px;
+                        padding-top: 20px;
                         border-top: 1px solid #333;
-                        color: #666;
-                        font-size: 0.9em;
-                    }}
-                    
-                    .uptime {{
                         color: #888;
-                        margin: 20px 0;
-                        font-size: 0.9em;
                     }}
-                    
                     @media (max-width: 600px) {{
                         .container {{
-                            padding: 20px 15px;
+                            padding: 10px;
                         }}
-                        
                         h1 {{
                             font-size: 2em;
                         }}
-                        
-                        .stats-grid {{
-                            grid-template-columns: 1fr;
-                        }}
-                    }}
-                    
-                    .highlight {{
-                        color: #4CAF50;
-                    }}
-                    
-                    a {{
-                        color: #4CAF50;
-                        text-decoration: none;
-                    }}
-                    
-                    a:hover {{
-                        text-decoration: underline;
                     }}
                 </style>
             </head>
@@ -1886,313 +1369,192 @@ class WebHandler(BaseHTTPRequestHandler):
                 <div class="container">
                     <header>
                         <h1>ANTI-RAID BOT</h1>
-                        <p class="subtitle">Защита Telegram чатов от рейдов и спама</p>
                         <div class="status">● АКТИВЕН</div>
+                        <p>Защита Telegram чатов</p>
                     </header>
                     
-                    <div class="section">
-                        <h2 class="section-title">СТАТИСТИКА</h2>
-                        <div class="stats-grid">
-                            <div class="stat-card">
-                                <div class="stat-number">{stats['chats']}</div>
-                                <div class="stat-label">ЧАТОВ</div>
-                            </div>
-                            <div class="stat-card">
-                                <div class="stat-number">{stats['exempt_users']}</div>
-                                <div class="stat-label">ИСКЛЮЧЕНИЙ</div>
-                            </div>
-                            <div class="stat-card">
-                                <div class="stat-number">{stats['actions']}</div>
-                                <div class="stat-label">ДЕЙСТВИЙ</div>
-                            </div>
-                            <div class="stat-card">
-                                <div class="stat-number">{stats['messages_processed']}</div>
-                                <div class="stat-label">СООБЩЕНИЙ</div>
-                            </div>
+                    <div class="stats">
+                        <div class="stat">
+                            <div class="stat-number">{stats['чаты']}</div>
+                            <div>Чатов</div>
                         </div>
-                        
-                        <div class="uptime">
-                            Время работы: {days}д {hours}ч {minutes}м
+                        <div class="stat">
+                            <div class="stat-number">{stats['исключения']}</div>
+                            <div>Исключений</div>
+                        </div>
+                        <div class="stat">
+                            <div class="stat-number">{stats['действия']}</div>
+                            <div>Действий</div>
                         </div>
                     </div>
                     
                     <div class="section">
-                        <h2 class="section-title">ФУНКЦИИ</h2>
+                        <h2>ФУНКЦИИ</h2>
                         <div class="features">
                             <div class="feature">
-                                <div class="feature-title">АНТИ-ФЛУД</div>
-                                <div class="feature-desc">Контроль скорости текстовых и медиа сообщений</div>
+                                <strong>Анти-флуд</strong>
+                                <p>Контроль скорости сообщений</p>
                             </div>
                             <div class="feature">
-                                <div class="feature-title">АНТИ-РЕЙД</div>
-                                <div class="feature-desc">Обнаружение массовых атак и автоматическая блокировка</div>
+                                <strong>Анти-рейд</strong>
+                                <p>Обнаружение массовых атак</p>
                             </div>
                             <div class="feature">
-                                <div class="feature-title">ИСКЛЮЧЕНИЯ</div>
-                                <div class="feature-desc">Белый список защищённых пользователей</div>
+                                <strong>Исключения</strong>
+                                <p>Белый список пользователей</p>
                             </div>
                             <div class="feature">
-                                <div class="feature-title">ГИБКАЯ НАСТРОЙКА</div>
-                                <div class="feature-desc">Индивидуальные параметры для каждого чата</div>
+                                <strong>Гибкие настройки</strong>
+                                <p>Индивидуальные параметры</p>
                             </div>
                         </div>
                     </div>
                     
                     <div class="section">
-                        <h2 class="section-title">КОМАНДЫ</h2>
-                        <div class="commands">
-                            <div class="command-group">
-                                <div class="group-title">ОСНОВНЫЕ</div>
-                                <div class="command">
-                                    <div class="cmd">/setup</div>
-                                    <div class="desc">Настройка защиты в чате</div>
-                                </div>
-                                <div class="command">
-                                    <div class="cmd">/settings</div>
-                                    <div class="desc">Текущие настройки</div>
-                                </div>
-                                <div class="command">
-                                    <div class="cmd">/lock</div>
-                                    <div class="desc">Блокировка чата</div>
-                                </div>
-                                <div class="command">
-                                    <div class="cmd">/unlock</div>
-                                    <div class="desc">Разблокировка чата</div>
-                                </div>
-                            </div>
-                            
-                            <div class="command-group">
-                                <div class="group-title">УПРАВЛЕНИЕ</div>
-                                <div class="command">
-                                    <div class="cmd">/exempt username</div>
-                                    <div class="desc">Добавить исключение</div>
-                                </div>
-                                <div class="command">
-                                    <div class="cmd">/promote username</div>
-                                    <div class="desc">Добавить админа бота</div>
-                                </div>
-                                <div class="command">
-                                    <div class="cmd">/stats</div>
-                                    <div class="desc">Статистика чата</div>
-                                </div>
-                                <div class="command">
-                                    <div class="cmd">/logs</div>
-                                    <div class="desc">История действий</div>
-                                </div>
-                            </div>
+                        <h2>КОМАНДЫ</h2>
+                        <div style="background: #222; padding: 20px; border-radius: 8px;">
+                            <p><strong>/setup</strong> - Настройка бота</p>
+                            <p><strong>!адм</strong> - Добавить админа (ответ на сообщение)</p>
+                            <p><strong>!искл</strong> - Добавить исключение (ответ на сообщение)</p>
+                            <p><strong>/stats</strong> - Статистика чата</p>
+                            <p><strong>/lock</strong> - Блокировка чата</p>
                         </div>
                     </div>
                     
                     <div class="section">
-                        <h2 class="section-title">ПОЛЬЗОВАТЕЛЬСКОЕ СОГЛАШЕНИЕ</h2>
-                        <div class="terms">
-                            <h3>1. ИСПОЛЬЗОВАНИЕ</h3>
-                            <p>Бот предназначен исключительно для защиты Telegram чатов от нежелательной активности.</p>
-                            
-                            <h3>2. ОТВЕТСТВЕННОСТЬ</h3>
-                            <p>Администраторы чатов несут полную ответственность за настройку и использование бота.</p>
-                            
-                            <h3>3. ДАННЫЕ</h3>
-                            <p>Бот хранит минимально необходимые данные для функционирования:</p>
-                            <ul>
-                                <li>ID чатов и пользователей</li>
-                                <li>Настройки системы защиты</li>
-                                <li>Временную историю сообщений</li>
-                            </ul>
-                            
-                            <h3>4. КОНФИДЕНЦИАЛЬНОСТЬ</h3>
-                            <p>Мы не передаём данные третьим лицам. Вся информация используется только для работы системы защиты.</p>
-                            
-                            <h3>5. ОГРАНИЧЕНИЯ</h3>
-                            <p>Бот не может:</p>
-                            <ul>
-                                <li>Читать содержимое сообщений</li>
-                                <li>Хранить персональные данные</li>
-                                <li>Отправлять сообщения от имени пользователей</li>
-                            </ul>
-                            
-                            <h3>6. КОНТАКТЫ</h3>
-                            <p>По вопросам работы бота обращайтесь через Telegram.</p>
+                        <h2>СОГЛАШЕНИЕ</h2>
+                        <div style="color: #ccc; line-height: 1.6;">
+                            <p>Бот предназначен для защиты чатов от нежелательной активности.</p>
+                            <p>Мы храним минимально необходимые данные для работы.</p>
+                            <p>Не передаём данные третьим лицам.</p>
                         </div>
                     </div>
                     
                     <footer>
                         <p>Anti-Raid Bot System</p>
-                        <p>© {datetime.now().year} | Сервер работает на Render.com</p>
-                        <p>Обновлено: {datetime.now().strftime('%d.%m.%Y %H:%M')}</p>
+                        <p>Время работы: {uptime.days} дней</p>
+                        <p>{datetime.now().strftime('%d.%m.%Y %H:%M')}</p>
                     </footer>
                 </div>
             </body>
             </html>
             """
-            
             self.wfile.write(html.encode("utf-8"))
         
         elif path == "/health":
             self.send_response(200)
             self.send_header("Content-type", "application/json")
             self.end_headers()
-            response = {
-                "status": "ok",
-                "timestamp": datetime.now().isoformat(),
-                "uptime_seconds": (datetime.now() - start_time).total_seconds()
-            }
+            response = {"status": "ok", "time": datetime.now().isoformat()}
             self.wfile.write(json.dumps(response).encode())
-        
-        elif path == "/stats":
-            self.send_response(200)
-            self.send_header("Content-type", "application/json")
-            self.end_headers()
-            stats = db.get_stats()
-            stats["status"] = "active"
-            stats["uptime"] = str(datetime.now() - start_time)
-            self.wfile.write(json.dumps(stats).encode())
         
         else:
             self.send_response(404)
             self.send_header("Content-type", "text/html")
             self.end_headers()
-            self.wfile.write(b"404 - Not Found")
+            self.wfile.write(b"404")
     
     def log_message(self, format, *args):
         pass
 
-def run_web_server(port=8080):
-    """Запуск веб-сервера"""
+def запустить_веб(port=8080):
     server = HTTPServer(('0.0.0.0', port), WebHandler)
-    print(f"🌐 Веб-сервер запущен: http://localhost:{port}")
+    print(f"🌐 Веб-сервер: http://localhost:{port}")
     server.serve_forever()
 
-# ============ ЗАПУСК БОТА ============
-
-def load_config():
-    """Загрузка конфигурации"""
-    config_path = Path("config.json")
-    if config_path.exists():
-        try:
-            with open(config_path, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except:
-            pass
-    return DEFAULT_CONFIG.copy()
+# ============ ЗАПУСК ============
 
 async def main():
-    """Основная функция запуска бота"""
-    config = load_config()
+    # Веб-сервер
+    веб_поток = threading.Thread(target=запустить_веб, args=(WEB_PORT,), daemon=True)
+    веб_поток.start()
     
-    if config["token"] == "ВАШ_ТОКЕН_ОТ_BOTFATHER":
-        print("❌ Установите токен бота в файле config.json")
-        print("Получите токен у @BotFather и вставьте в config.json")
-        return
+    # Бот
+    приложение = Application.builder().token(TOKEN).build()
     
-    # Запуск веб-сервера
-    web_thread = threading.Thread(
-        target=run_web_server,
-        args=(config.get("web_port", 8080),),
-        daemon=True
-    )
-    web_thread.start()
-    print("✅ Веб-сервер запущен")
-    
-    # Создание приложения бота
-    application = Application.builder().token(config["token"]).build()
-    
-    # Регистрация команд
-    commands = [
-        ("start", start_cmd),
-        ("setup", setup_cmd),
-        ("settings", settings_cmd),
-        ("status", status_cmd),
-        ("lock", lock_cmd),
-        ("unlock", unlock_cmd),
-        ("slow", slow_cmd),
-        ("normal", normal_cmd),
-        ("exempt", exempt_cmd),
-        ("unexempt", unexempt_cmd),
-        ("exemptlist", exemptlist_cmd),
-        ("promote", promote_cmd),
-        ("demote", demote_cmd),
-        ("admins", admins_cmd),
-        ("stats", stats_cmd),
-        ("logs", logs_cmd),
-        ("warnings", warnings_cmd),
-        ("help", start_cmd)
+    # Команды
+    команды = [
+        ("start", команда_старт),
+        ("setup", команда_настройка),
+        ("settings", команда_настройки),
+        ("status", команда_статус),
+        ("lock", команда_блокировка),
+        ("unlock", команда_разблокировка),
+        ("slow", команда_медленный),
+        ("normal", команда_нормальный),
+        ("админы", команда_админы),
+        ("исключения", команда_исключения),
+        ("stats", команда_статистика),
+        ("logs", команда_логи),
+        ("help", команда_старт),
     ]
     
-    for cmd, handler in commands:
-        application.add_handler(CommandHandler(cmd, handler))
+    for команда, обработчик in команды:
+        приложение.add_handler(CommandHandler(команда, обработчик))
     
-    # Инлайн-кнопки
-    application.add_handler(CallbackQueryHandler(button_handler))
+    # Команды через !
+    команды_воскл = [
+        ("адм", команда_адм),
+        ("снять", команда_снять),
+        ("искл", команда_искл),
+        ("нискл", команда_нискл),
+        ("варн", команда_варн),
+        ("варны", команда_варны),
+        ("снятьварны", команда_снятьварны),
+    ]
     
-    # Обработчик ввода параметров
-    application.add_handler(MessageHandler(
+    for команда, обработчик in команды_воскл:
+        приложение.add_handler(MessageHandler(
+            filters.Regex(f'^!{команда}') & ~filters.COMMAND,
+            обработчик
+        ))
+    
+    # Кнопки
+    приложение.add_handler(CallbackQueryHandler(обработчик_кнопок))
+    
+    # Ввод параметров
+    приложение.add_handler(MessageHandler(
         filters.TEXT & ~filters.COMMAND,
-        param_input_handler
+        обработчик_ввода
     ))
     
-    # Основной обработчик сообщений
-    application.add_handler(MessageHandler(
+    # Обработчик сообщений
+    приложение.add_handler(MessageHandler(
         filters.ALL & ~filters.COMMAND,
-        message_handler
+        обработчик_сообщений
     ))
     
-    # Запуск бота
-    print("🤖 Anti-Raid Bot запущен")
-    print("=" * 50)
-    print("📋 Основные команды:")
-    print("  /setup - Настройка защиты")
-    print("  /exempt username - Добавить исключение")
-    print("  /promote username - Добавить админа")
-    print("=" * 50)
+    print("🤖 Бот запущен")
+    print("✅ Все команды работают")
     
-    # Автосохранение базы данных
-    async def auto_save():
+    await приложение.initialize()
+    await приложение.start()
+    await приложение.updater.start_polling()
+    
+    # Автосохранение
+    async def автосохранение():
         while True:
-            await asyncio.sleep(300)  # Каждые 5 минут
-            db.conn.commit()
-            print("💾 База данных сохранена")
+            await asyncio.sleep(300)
+            база.conn.commit()
     
-    asyncio.create_task(auto_save())
+    asyncio.create_task(автосохранение())
     
-    await application.initialize()
-    await application.start()
-    await application.updater.start_polling()
-    
-    # Бесконечный цикл
     await asyncio.Event().wait()
 
 if __name__ == "__main__":
-    # Создание необходимых файлов
-    if not Path("config.json").exists():
-        with open("config.json", "w", encoding="utf-8") as f:
-            json.dump(DEFAULT_CONFIG, f, indent=2)
-        print("📁 Создан config.json")
-        print("⚠️ Замените 'ВАШ_ТОКЕН_ОТ_BOTFATHER' на ваш токен")
-    
+    # Создать файлы
     if not Path("requirements.txt").exists():
-        with open("requirements.txt", "w", encoding="utf-8") as f:
+        with open("requirements.txt", "w") as f:
             f.write("python-telegram-bot==20.7\n")
-        print("📁 Создан requirements.txt")
     
     if not Path("Procfile").exists():
-        with open("Procfile", "w", encoding="utf-8") as f:
+        with open("Procfile", "w") as f:
             f.write("web: python bot.py\n")
-        print("📁 Создан Procfile")
     
-    if not Path("runtime.txt").exists():
-        with open("runtime.txt", "w", encoding="utf-8") as f:
-            f.write("python-3.11.0\n")
-        print("📁 Создан runtime.txt")
-    
-    # Запуск
+    # Запустить
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("\n👋 Остановка бота...")
-        db.close()
+        print("\n👋 Остановка")
     except Exception as e:
         print(f"❌ Ошибка: {e}")
-        import traceback
-        traceback.print_exc()
-        db.close()
