@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-🛡️ ANTI-RAID BOT - РАБОЧАЯ ВЕРСИЯ
+🛡️ ANTI-RAID BOT - СТАБИЛЬНАЯ ВЕРСИЯ
 Telegram: @anti_raid_system_bot
 """
 
@@ -9,7 +9,7 @@ import json
 import logging
 import sqlite3
 import threading
-import re
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -35,11 +35,13 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
+from telegram.error import TimedOut, NetworkError, RetryAfter
 
 # ============ КОНСТАНТЫ ============
 
 TOKEN = "8290647556:AAHRcf50ez31bJbKchCCFr3xKazyhZUWkQQ"
 WEB_PORT = 8080
+RETRY_DELAY = 5  # секунд между попытками
 
 # Настройки по умолчанию
 DEFAULT_CONFIG = {
@@ -359,6 +361,35 @@ logger = logging.getLogger(__name__)
 
 # ============ ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ============
 
+async def safe_request(func, *args, **kwargs):
+    """Безопасный запрос с повторными попытками"""
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            return await func(*args, **kwargs)
+        except TimedOut:
+            if attempt < max_retries - 1:
+                await asyncio.sleep(RETRY_DELAY * (attempt + 1))
+                continue
+            else:
+                logger.error(f"Таймаут после {max_retries} попыток: {func.__name__}")
+                raise
+        except RetryAfter as e:
+            wait_time = e.retry_after
+            logger.warning(f"RetryAfter: ожидание {wait_time} секунд")
+            await asyncio.sleep(wait_time)
+            continue
+        except NetworkError as e:
+            if attempt < max_retries - 1:
+                await asyncio.sleep(RETRY_DELAY * (attempt + 1))
+                continue
+            else:
+                logger.error(f"Сетевая ошибка: {e}")
+                raise
+        except Exception as e:
+            logger.error(f"Ошибка в {func.__name__}: {e}")
+            raise
+
 async def resolve_user(identifier: str, context: ContextTypes.DEFAULT_TYPE, 
                       message: Message = None) -> Optional[Tuple[int, str]]:
     """Определяет пользователя по reply, username или ID"""
@@ -395,7 +426,7 @@ async def is_protected(chat_id: int, user_id: int, context: ContextTypes.DEFAULT
     
     if settings.get("игнор_админов", True):
         try:
-            member = await context.bot.get_chat_member(chat_id, user_id)
+            member = await safe_request(context.bot.get_chat_member, chat_id, user_id)
             if member.status in [ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER]:
                 return True
         except:
@@ -403,7 +434,7 @@ async def is_protected(chat_id: int, user_id: int, context: ContextTypes.DEFAULT
     
     if settings.get("защита_новых", True):
         try:
-            member = await context.bot.get_chat_member(chat_id, user_id)
+            member = await safe_request(context.bot.get_chat_member, chat_id, user_id)
             if hasattr(member, 'joined_date') and member.joined_date:
                 join_time = datetime.fromtimestamp(member.joined_date)
                 if datetime.now() - join_time < timedelta(hours=24):
@@ -451,13 +482,17 @@ async def check_flood(update: Update, context: ContextTypes.DEFAULT_TYPE) -> boo
         
         if warnings < warnings_to_ban - 1:
             db.add_warning(chat.id, user.id)
-            await update.message.reply_text(f"⚠️ Предупреждение {warnings + 1}/{warnings_to_ban}")
+            try:
+                await safe_request(update.message.reply_text, f"⚠️ Предупреждение {warnings + 1}/{warnings_to_ban}")
+            except:
+                pass
             return True
         else:
             try:
                 if settings.get("бан_часы", 0) > 0:
                     ban_until = datetime.now() + timedelta(hours=settings["бан_часы"])
-                    await context.bot.ban_chat_member(
+                    await safe_request(
+                        context.bot.ban_chat_member,
                         chat_id=chat.id,
                         user_id=user.id,
                         until_date=int(ban_until.timestamp())
@@ -466,7 +501,8 @@ async def check_flood(update: Update, context: ContextTypes.DEFAULT_TYPE) -> boo
                     duration = f"{settings['бан_часы']}ч"
                 else:
                     mute_until = datetime.now() + timedelta(minutes=settings.get("мут_минуты", 30))
-                    await context.bot.restrict_chat_member(
+                    await safe_request(
+                        context.bot.restrict_chat_member,
                         chat_id=chat.id,
                         user_id=user.id,
                         permissions=ChatPermissions(can_send_messages=False),
@@ -478,11 +514,14 @@ async def check_flood(update: Update, context: ContextTypes.DEFAULT_TYPE) -> boo
                 db.add_log(chat.id, action, user.id)
                 db.clear_warnings(chat.id, user.id)
                 
-                await update.message.reply_text(f"🚨 Пользователь {'забанен' if action == 'бан' else 'замучен'} на {duration}")
+                try:
+                    await safe_request(update.message.reply_text, f"🚨 Пользователь {'забанен' if action == 'бан' else 'замучен'} на {duration}")
+                except:
+                    pass
                 return True
                 
             except Exception as e:
-                logger.error(f"Ошибка: {e}")
+                logger.error(f"Ошибка наказания: {e}")
     
     return False
 
@@ -493,20 +532,26 @@ async def check_raid(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
     if activity >= settings["порог_рейда"]:
         if settings["авто_блокировка"]:
             try:
-                await context.bot.set_chat_permissions(
+                await safe_request(
+                    context.bot.set_chat_permissions,
                     chat_id=chat_id,
                     permissions=ChatPermissions(can_send_messages=False)
                 )
                 db.add_log(chat_id, "блокировка")
-                await context.bot.send_message(
-                    chat_id=chat_id,
-                    text=f"🔒 Чат заблокирован на {settings['блокировка_время']} минут"
-                )
+                try:
+                    await safe_request(
+                        context.bot.send_message,
+                        chat_id=chat_id,
+                        text=f"🔒 Чат заблокирован на {settings['блокировка_время']} минут"
+                    )
+                except:
+                    pass
                 
                 async def unlock():
                     await asyncio.sleep(settings['блокировка_время'] * 60)
                     try:
-                        await context.bot.set_chat_permissions(
+                        await safe_request(
+                            context.bot.set_chat_permissions,
                             chat_id=chat_id,
                             permissions=ChatPermissions(can_send_messages=True)
                         )
@@ -519,15 +564,20 @@ async def check_raid(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
                 logger.error(f"Ошибка блокировки: {e}")
         elif settings["авто_медленный"]:
             try:
-                await context.bot.set_chat_permissions(
+                await safe_request(
+                    context.bot.set_chat_permissions,
                     chat_id=chat_id,
                     permissions=ChatPermissions(can_send_messages=True),
                     slow_mode_delay=settings["задержка_медленного"]
                 )
-                await context.bot.send_message(
-                    chat_id=chat_id,
-                    text=f"🐢 Медленный режим: {settings['задержка_медленного']} сек"
-                )
+                try:
+                    await safe_request(
+                        context.bot.send_message,
+                        chat_id=chat_id,
+                        text=f"🐢 Медленный режим: {settings['задержка_медленного']} сек"
+                    )
+                except:
+                    pass
             except:
                 pass
 
@@ -539,9 +589,12 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if chat.type == ChatType.PRIVATE:
         return
     
-    flood = await check_flood(update, context)
-    if not flood:
-        await check_raid(chat.id, context)
+    try:
+        flood = await check_flood(update, context)
+        if not flood:
+            await check_raid(chat.id, context)
+    except Exception as e:
+        logger.error(f"Ошибка в обработчике сообщений: {e}")
 
 # ============ КОМАНДЫ ============
 
@@ -577,29 +630,44 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 2. Напишите !адм (без аргументов)
 3. Пользователь станет админом бота
 """
-    await update.message.reply_text(text)
+    try:
+        await safe_request(update.message.reply_text, text)
+    except:
+        pass
 
 async def setup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     user = update.effective_user
     
     if chat.type == ChatType.PRIVATE:
-        await update.message.reply_text("Добавьте меня в группу для настройки.")
+        try:
+            await safe_request(update.message.reply_text, "Добавьте меня в группу для настройки.")
+        except:
+            pass
         return
     
     try:
-        member = await context.bot.get_chat_member(chat.id, user.id)
+        member = await safe_request(context.bot.get_chat_member, chat.id, user.id)
         if member.status not in [ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER]:
-            await update.message.reply_text("Требуются права администратора.")
+            try:
+                await safe_request(update.message.reply_text, "Требуются права администратора.")
+            except:
+                pass
             return
     except:
-        await update.message.reply_text("Ошибка проверки прав.")
+        try:
+            await safe_request(update.message.reply_text, "Ошибка проверки прав.")
+        except:
+            pass
         return
     
     owner = db.get_owner(chat.id)
     if not owner:
         db.set_owner(chat.id, user.id)
-        await update.message.reply_text("✅ Вы стали владельцем защиты в этом чате.")
+        try:
+            await safe_request(update.message.reply_text, "✅ Вы стали владельцем защиты в этом чате.")
+        except:
+            pass
     
     keyboard = [
         [InlineKeyboardButton("📊 Анти-флуд", callback_data="menu_flood")],
@@ -610,16 +678,23 @@ async def setup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("📊 Статистика", callback_data="menu_stats")]
     ]
     
-    await update.message.reply_text(
-        "⚙️ Панель управления защитой\nВыберите раздел:",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
+    try:
+        await safe_request(
+            update.message.reply_text,
+            "⚙️ Панель управления защитой\nВыберите раздел:",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+    except:
+        pass
 
 async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     
     if chat.type == ChatType.PRIVATE:
-        await update.message.reply_text("Используйте в группе.")
+        try:
+            await safe_request(update.message.reply_text, "Используйте в группе.")
+        except:
+            pass
         return
     
     settings = db.get_chat_settings(chat.id)
@@ -646,13 +721,19 @@ async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 • Админы бота: {len(db.get_bot_admins(chat.id))}
 """
     
-    await update.message.reply_text(text)
+    try:
+        await safe_request(update.message.reply_text, text)
+    except:
+        pass
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     
     if chat.type == ChatType.PRIVATE:
-        await update.message.reply_text("Используйте в группе.")
+        try:
+            await safe_request(update.message.reply_text, "Используйте в группе.")
+        except:
+            pass
         return
     
     settings = db.get_chat_settings(chat.id)
@@ -672,48 +753,68 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 📈 Активность (за 1 мин): {db.get_chat_activity(chat.id, 60):.1f} сообщ/сек
 """
     
-    await update.message.reply_text(text)
+    try:
+        await safe_request(update.message.reply_text, text)
+    except:
+        pass
 
 async def lock_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     user = update.effective_user
     
     if not db.is_bot_admin(chat.id, user.id):
-        await update.message.reply_text("Требуются права админа бота.")
+        try:
+            await safe_request(update.message.reply_text, "Требуются права админа бота.")
+        except:
+            pass
         return
     
     try:
-        await context.bot.set_chat_permissions(
+        await safe_request(
+            context.bot.set_chat_permissions,
             chat_id=chat.id,
             permissions=ChatPermissions(can_send_messages=False)
         )
-        await update.message.reply_text("🔒 Чат заблокирован")
+        await safe_request(update.message.reply_text, "🔒 Чат заблокирован")
     except Exception as e:
-        await update.message.reply_text(f"Ошибка: {e}")
+        try:
+            await safe_request(update.message.reply_text, f"Ошибка: {e}")
+        except:
+            pass
 
 async def unlock_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     user = update.effective_user
     
     if not db.is_bot_admin(chat.id, user.id):
-        await update.message.reply_text("Требуются права админа бота.")
+        try:
+            await safe_request(update.message.reply_text, "Требуются права админа бота.")
+        except:
+            pass
         return
     
     try:
-        await context.bot.set_chat_permissions(
+        await safe_request(
+            context.bot.set_chat_permissions,
             chat_id=chat.id,
             permissions=ChatPermissions(can_send_messages=True)
         )
-        await update.message.reply_text("🔓 Чат разблокирован")
+        await safe_request(update.message.reply_text, "🔓 Чат разблокирован")
     except Exception as e:
-        await update.message.reply_text(f"Ошибка: {e}")
+        try:
+            await safe_request(update.message.reply_text, f"Ошибка: {e}")
+        except:
+            pass
 
 async def slow_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     user = update.effective_user
     
     if not db.is_bot_admin(chat.id, user.id):
-        await update.message.reply_text("Требуются права админа бота.")
+        try:
+            await safe_request(update.message.reply_text, "Требуются права админа бота.")
+        except:
+            pass
         return
     
     delay = 15
@@ -726,45 +827,62 @@ async def slow_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
     
     try:
-        await context.bot.set_chat_permissions(
+        await safe_request(
+            context.bot.set_chat_permissions,
             chat_id=chat.id,
             permissions=ChatPermissions(can_send_messages=True),
             slow_mode_delay=delay
         )
-        await update.message.reply_text(f"🐢 Медленный режим: {delay} секунд")
+        await safe_request(update.message.reply_text, f"🐢 Медленный режим: {delay} секунд")
     except Exception as e:
-        await update.message.reply_text(f"Ошибка: {e}")
+        try:
+            await safe_request(update.message.reply_text, f"Ошибка: {e}")
+        except:
+            pass
 
 async def normal_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     user = update.effective_user
     
     if not db.is_bot_admin(chat.id, user.id):
-        await update.message.reply_text("Требуются права админа бота.")
+        try:
+            await safe_request(update.message.reply_text, "Требуются права админа бота.")
+        except:
+            pass
         return
     
     try:
-        await context.bot.set_chat_permissions(
+        await safe_request(
+            context.bot.set_chat_permissions,
             chat_id=chat.id,
             permissions=ChatPermissions(can_send_messages=True),
             slow_mode_delay=0
         )
-        await update.message.reply_text("🚀 Медленный режим выключен")
+        await safe_request(update.message.reply_text, "🚀 Медленный режим выключен")
     except Exception as e:
-        await update.message.reply_text(f"Ошибка: {e}")
+        try:
+            await safe_request(update.message.reply_text, f"Ошибка: {e}")
+        except:
+            pass
 
 async def admins_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     
     if chat.type == ChatType.PRIVATE:
-        await update.message.reply_text("Используйте в группе.")
+        try:
+            await safe_request(update.message.reply_text, "Используйте в группе.")
+        except:
+            pass
         return
     
     admins = db.get_bot_admins(chat.id)
     owner = db.get_owner(chat.id)
     
     if not admins:
-        await update.message.reply_text("Нет админов бота.")
+        try:
+            await safe_request(update.message.reply_text, "Нет админов бота.")
+        except:
+            pass
         return
     
     text = "👑 Админы бота:\n\n"
@@ -777,19 +895,28 @@ async def admins_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             display = f"@{username}" if username else f"ID {user_id}"
             text += f"• {display}\n"
     
-    await update.message.reply_text(text)
+    try:
+        await safe_request(update.message.reply_text, text)
+    except:
+        pass
 
 async def exceptions_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     
     if chat.type == ChatType.PRIVATE:
-        await update.message.reply_text("Используйте в группе.")
+        try:
+            await safe_request(update.message.reply_text, "Используйте в группе.")
+        except:
+            pass
         return
     
     exceptions = db.get_exceptions(chat.id)
     
     if not exceptions:
-        await update.message.reply_text("Нет исключённых пользователей.")
+        try:
+            await safe_request(update.message.reply_text, "Нет исключённых пользователей.")
+        except:
+            pass
         return
     
     text = "👥 Исключённые пользователи:\n\n"
@@ -797,13 +924,19 @@ async def exceptions_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         display = f"@{username}" if username else f"ID {user_id}"
         text += f"• {display}\n"
     
-    await update.message.reply_text(text)
+    try:
+        await safe_request(update.message.reply_text, text)
+    except:
+        pass
 
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     
     if chat.type == ChatType.PRIVATE:
-        await update.message.reply_text("Используйте в группе.")
+        try:
+            await safe_request(update.message.reply_text, "Используйте в группе.")
+        except:
+            pass
         return
     
     settings = db.get_chat_settings(chat.id)
@@ -824,20 +957,29 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 • Порог рейда: {settings['порог_рейда']}/сек
 """
     
-    await update.message.reply_text(text)
+    try:
+        await safe_request(update.message.reply_text, text)
+    except:
+        pass
 
 async def logs_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     user = update.effective_user
     
     if not db.is_bot_admin(chat.id, user.id):
-        await update.message.reply_text("Требуются права админа бота.")
+        try:
+            await safe_request(update.message.reply_text, "Требуются права админа бота.")
+        except:
+            pass
         return
     
     logs = db.get_logs(chat.id, 10)
     
     if not logs:
-        await update.message.reply_text("Нет записей о действиях.")
+        try:
+            await safe_request(update.message.reply_text, "Нет записей о действиях.")
+        except:
+            pass
         return
     
     text = "📝 История действий:\n\n"
@@ -848,7 +990,10 @@ async def logs_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text += f" (ID {log['target_id']})"
         text += "\n"
     
-    await update.message.reply_text(text)
+    try:
+        await safe_request(update.message.reply_text, text)
+    except:
+        pass
 
 # ============ КОМАНДЫ ЧЕРЕЗ ! ============
 
@@ -863,14 +1008,20 @@ async def add_admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     owner = db.get_owner(chat.id)
     if user.id != owner:
-        await update.message.reply_text("Только владелец может добавлять админов.")
+        try:
+            await safe_request(update.message.reply_text, "Только владелец может добавлять админов.")
+        except:
+            pass
         return
     
     argument = context.args[0] if context.args else ""
     result = await resolve_user(argument, context, message)
     
     if not result:
-        await update.message.reply_text("Ответьте на сообщение пользователя или укажите ID.")
+        try:
+            await safe_request(update.message.reply_text, "Ответьте на сообщение пользователя или укажите ID.")
+        except:
+            pass
         return
     
     target_id, target_username = result
@@ -878,14 +1029,20 @@ async def add_admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if target_id == user.id:
         return
     
-    bot_info = await context.bot.get_me()
+    bot_info = await safe_request(context.bot.get_me)
     if target_id == bot_info.id:
-        await update.message.reply_text("Нельзя добавить бота.")
+        try:
+            await safe_request(update.message.reply_text, "Нельзя добавить бота.")
+        except:
+            pass
         return
     
     db.add_bot_admin(chat.id, target_id, user.id, target_username)
     display = f"@{target_username}" if target_username else f"ID {target_id}"
-    await update.message.reply_text(f"✅ {display} теперь админ бота")
+    try:
+        await safe_request(update.message.reply_text, f"✅ {display} теперь админ бота")
+    except:
+        pass
 
 async def remove_admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """!снять - удалить админа бота"""
@@ -898,25 +1055,37 @@ async def remove_admin_command(update: Update, context: ContextTypes.DEFAULT_TYP
     
     owner = db.get_owner(chat.id)
     if user.id != owner:
-        await update.message.reply_text("Только владелец может удалять админов.")
+        try:
+            await safe_request(update.message.reply_text, "Только владелец может удалять админов.")
+        except:
+            pass
         return
     
     argument = context.args[0] if context.args else ""
     result = await resolve_user(argument, context, message)
     
     if not result:
-        await update.message.reply_text("Ответьте на сообщение пользователя или укажите ID.")
+        try:
+            await safe_request(update.message.reply_text, "Ответьте на сообщение пользователя или укажите ID.")
+        except:
+            pass
         return
     
     target_id, target_username = result
     
     if target_id == owner:
-        await update.message.reply_text("Нельзя удалить владельца.")
+        try:
+            await safe_request(update.message.reply_text, "Нельзя удалить владельца.")
+        except:
+            pass
         return
     
     db.remove_bot_admin(chat.id, target_id)
     display = f"@{target_username}" if target_username else f"ID {target_id}"
-    await update.message.reply_text(f"✅ {display} больше не админ бота")
+    try:
+        await safe_request(update.message.reply_text, f"✅ {display} больше не админ бота")
+    except:
+        pass
 
 async def add_exception_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """!искл - добавить исключение"""
@@ -928,21 +1097,30 @@ async def add_exception_command(update: Update, context: ContextTypes.DEFAULT_TY
         return
     
     if not db.is_bot_admin(chat.id, user.id):
-        await update.message.reply_text("Требуются права админа бота.")
+        try:
+            await safe_request(update.message.reply_text, "Требуются права админа бота.")
+        except:
+            pass
         return
     
     argument = context.args[0] if context.args else ""
     result = await resolve_user(argument, context, message)
     
     if not result:
-        await update.message.reply_text("Ответьте на сообщение пользователя или укажите ID.")
+        try:
+            await safe_request(update.message.reply_text, "Ответьте на сообщение пользователя или укажите ID.")
+        except:
+            pass
         return
     
     target_id, target_username = result
     
     db.add_exception(chat.id, target_id, target_username, "команда")
     display = f"@{target_username}" if target_username else f"ID {target_id}"
-    await update.message.reply_text(f"✅ {display} добавлен в исключения")
+    try:
+        await safe_request(update.message.reply_text, f"✅ {display} добавлен в исключения")
+    except:
+        pass
 
 async def remove_exception_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """!нискл - удалить исключение"""
@@ -954,21 +1132,30 @@ async def remove_exception_command(update: Update, context: ContextTypes.DEFAULT
         return
     
     if not db.is_bot_admin(chat.id, user.id):
-        await update.message.reply_text("Требуются права админа бота.")
+        try:
+            await safe_request(update.message.reply_text, "Требуются права админа бота.")
+        except:
+            pass
         return
     
     argument = context.args[0] if context.args else ""
     result = await resolve_user(argument, context, message)
     
     if not result:
-        await update.message.reply_text("Ответьте на сообщение пользователя или укажите ID.")
+        try:
+            await safe_request(update.message.reply_text, "Ответьте на сообщение пользователя или укажите ID.")
+        except:
+            pass
         return
     
     target_id, target_username = result
     
     db.remove_exception(chat.id, target_id)
     display = f"@{target_username}" if target_username else f"ID {target_id}"
-    await update.message.reply_text(f"✅ {display} удалён из исключений")
+    try:
+        await safe_request(update.message.reply_text, f"✅ {display} удалён из исключений")
+    except:
+        pass
 
 async def add_warning_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """!варн - выдать предупреждение"""
@@ -980,20 +1167,29 @@ async def add_warning_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
     
     if not db.is_bot_admin(chat.id, user.id):
-        await update.message.reply_text("Требуются права админа бота.")
+        try:
+            await safe_request(update.message.reply_text, "Требуются права админа бота.")
+        except:
+            pass
         return
     
     argument = context.args[0] if context.args else ""
     result = await resolve_user(argument, context, message)
     
     if not result:
-        await update.message.reply_text("Ответьте на сообщение пользователя или укажите ID.")
+        try:
+            await safe_request(update.message.reply_text, "Ответьте на сообщение пользователя или укажите ID.")
+        except:
+            pass
         return
     
     target_id, target_username = result
     
     if await is_protected(chat.id, target_id, context):
-        await update.message.reply_text("Этот пользователь защищён.")
+        try:
+            await safe_request(update.message.reply_text, "Этот пользователь защищён.")
+        except:
+            pass
         return
     
     db.add_warning(chat.id, target_id)
@@ -1001,16 +1197,23 @@ async def add_warning_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     settings = db.get_chat_settings(chat.id)
     
     display = f"@{target_username}" if target_username else f"ID {target_id}"
-    await update.message.reply_text(f"⚠️ {display} предупреждение {warnings}/{settings['варны_до_бана']}")
+    try:
+        await safe_request(update.message.reply_text, f"⚠️ {display} предупреждение {warnings}/{settings['варны_до_бана']}")
+    except:
+        pass
     
     if warnings >= settings['варны_до_бана']:
         try:
-            await context.bot.ban_chat_member(
+            await safe_request(
+                context.bot.ban_chat_member,
                 chat_id=chat.id,
                 user_id=target_id,
                 until_date=int((datetime.now() + timedelta(hours=2)).timestamp())
             )
-            await update.message.reply_text(f"🚨 {display} забанен за предупреждения")
+            try:
+                await safe_request(update.message.reply_text, f"🚨 {display} забанен за предупреждения")
+            except:
+                pass
             db.clear_warnings(chat.id, target_id)
         except Exception as e:
             logger.error(f"Ошибка: {e}")
@@ -1025,27 +1228,39 @@ async def check_warnings_command(update: Update, context: ContextTypes.DEFAULT_T
         return
     
     if not db.is_bot_admin(chat.id, user.id):
-        await update.message.reply_text("Требуются права админа бота.")
+        try:
+            await safe_request(update.message.reply_text, "Требуются права админа бота.")
+        except:
+            pass
         return
     
     argument = context.args[0] if context.args else ""
     
     if not argument and not message.reply_to_message:
         warnings = db.get_warnings(chat.id, user.id)
-        await update.message.reply_text(f"Ваши предупреждения: {warnings}/2")
+        try:
+            await safe_request(update.message.reply_text, f"Ваши предупреждения: {warnings}/2")
+        except:
+            pass
         return
     
     result = await resolve_user(argument, context, message)
     
     if not result:
-        await update.message.reply_text("Ответьте на сообщение пользователя или укажите ID.")
+        try:
+            await safe_request(update.message.reply_text, "Ответьте на сообщение пользователя или укажите ID.")
+        except:
+            pass
         return
     
     target_id, target_username = result
     warnings = db.get_warnings(chat.id, target_id)
     
     display = f"@{target_username}" if target_username else f"ID {target_id}"
-    await update.message.reply_text(f"⚠️ {display} предупреждений: {warnings}/2")
+    try:
+        await safe_request(update.message.reply_text, f"⚠️ {display} предупреждений: {warnings}/2")
+    except:
+        pass
 
 async def clear_warnings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """!снятьварны - снять все предупреждения"""
@@ -1057,21 +1272,30 @@ async def clear_warnings_command(update: Update, context: ContextTypes.DEFAULT_T
         return
     
     if not db.is_bot_admin(chat.id, user.id):
-        await update.message.reply_text("Требуются права админа бота.")
+        try:
+            await safe_request(update.message.reply_text, "Требуются права админа бота.")
+        except:
+            pass
         return
     
     argument = context.args[0] if context.args else ""
     result = await resolve_user(argument, context, message)
     
     if not result:
-        await update.message.reply_text("Ответьте на сообщение пользователя или укажите ID.")
+        try:
+            await safe_request(update.message.reply_text, "Ответьте на сообщение пользователя или укажите ID.")
+        except:
+            pass
         return
     
     target_id, target_username = result
     
     db.clear_warnings(chat.id, target_id)
     display = f"@{target_username}" if target_username else f"ID {target_id}"
-    await update.message.reply_text(f"✅ Все предупреждения сняты у {display}")
+    try:
+        await safe_request(update.message.reply_text, f"✅ Все предупреждения сняты у {display}")
+    except:
+        pass
 
 # ============ КНОПКИ ============
 
@@ -1084,7 +1308,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = query.from_user.id
     
     if not db.is_bot_admin(chat_id, user_id):
-        await query.edit_message_text("Требуются права админа бота.")
+        try:
+            await safe_request(query.edit_message_text, "Требуются права админа бота.")
+        except:
+            pass
         return
     
     settings = db.get_chat_settings(chat_id)
@@ -1097,7 +1324,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton(f"Строгий: {'✅' if settings['строгий_режим'] else '❌'}", callback_data="toggle_strict")],
             [InlineKeyboardButton("⬅️ Назад", callback_data="back")]
         ]
-        await query.edit_message_text("📊 Анти-флуд:", reply_markup=InlineKeyboardMarkup(keyboard))
+        try:
+            await safe_request(
+                query.edit_message_text,
+                "📊 Анти-флуд:",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+        except:
+            pass
     
     elif data == "menu_raid":
         keyboard = [
@@ -1107,7 +1341,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton(f"Auto: {'✅' if settings['авто_блокировка'] else '❌'}", callback_data="toggle_auto")],
             [InlineKeyboardButton("⬅️ Назад", callback_data="back")]
         ]
-        await query.edit_message_text("🛡️ Анти-рейд:", reply_markup=InlineKeyboardMarkup(keyboard))
+        try:
+            await safe_request(
+                query.edit_message_text,
+                "🛡️ Анти-рейд:",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+        except:
+            pass
     
     elif data == "menu_settings":
         keyboard = [
@@ -1116,7 +1357,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton(f"Варны: {settings['варны_до_бана']}", callback_data="set_warnings")],
             [InlineKeyboardButton("⬅️ Назад", callback_data="back")]
         ]
-        await query.edit_message_text("⚙️ Наказания:", reply_markup=InlineKeyboardMarkup(keyboard))
+        try:
+            await safe_request(
+                query.edit_message_text,
+                "⚙️ Наказания:",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+        except:
+            pass
     
     elif data == "menu_exceptions":
         count = len(db.get_exceptions(chat_id))
@@ -1126,7 +1374,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton(f"📋 Список ({count})", callback_data="list_exceptions")],
             [InlineKeyboardButton("⬅️ Назад", callback_data="back")]
         ]
-        await query.edit_message_text("👥 Исключения:", reply_markup=InlineKeyboardMarkup(keyboard))
+        try:
+            await safe_request(
+                query.edit_message_text,
+                "👥 Исключения:",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+        except:
+            pass
     
     elif data == "menu_admins":
         count = len(db.get_bot_admins(chat_id))
@@ -1136,7 +1391,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton(f"📋 Список ({count})", callback_data="list_admins")],
             [InlineKeyboardButton("⬅️ Назад", callback_data="back")]
         ]
-        await query.edit_message_text("👑 Админы:", reply_markup=InlineKeyboardMarkup(keyboard))
+        try:
+            await safe_request(
+                query.edit_message_text,
+                "👑 Админы:",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+        except:
+            pass
     
     elif data == "menu_stats":
         activity = db.get_chat_activity(chat_id, 60)
@@ -1147,7 +1409,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 👑 Админы: {len(db.get_bot_admins(chat_id))}
 """
         keyboard = [[InlineKeyboardButton("⬅️ Назад", callback_data="back")]]
-        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+        try:
+            await safe_request(
+                query.edit_message_text,
+                text,
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+        except:
+            pass
     
     elif data == "back":
         keyboard = [
@@ -1158,7 +1427,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("👑 Админы", callback_data="menu_admins")],
             [InlineKeyboardButton("📊 Статистика", callback_data="menu_stats")]
         ]
-        await query.edit_message_text("⚙️ Панель управления:", reply_markup=InlineKeyboardMarkup(keyboard))
+        try:
+            await safe_request(
+                query.edit_message_text,
+                "⚙️ Панель управления:",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+        except:
+            pass
     
     elif data.startswith("toggle_"):
         if data == "toggle_strict":
@@ -1186,7 +1462,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parameter, question = param_map[data]
             context.user_data["parameter"] = parameter
             context.user_data["chat"] = chat_id
-            await query.edit_message_text(f"{question}\n\nОтправьте число в чат.")
+            try:
+                await safe_request(
+                    query.edit_message_text,
+                    f"{question}\n\nОтправьте число в чат."
+                )
+            except:
+                pass
     
     elif data == "list_exceptions":
         exceptions = db.get_exceptions(chat_id)
@@ -1198,7 +1480,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             text = "Нет исключений"
         keyboard = [[InlineKeyboardButton("⬅️ Назад", callback_data="menu_exceptions")]]
-        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+        try:
+            await safe_request(
+                query.edit_message_text,
+                text,
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+        except:
+            pass
     
     elif data == "list_admins":
         admins = db.get_bot_admins(chat_id)
@@ -1215,43 +1504,62 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             text = "Нет админов"
         keyboard = [[InlineKeyboardButton("⬅️ Назад", callback_data="menu_admins")]]
-        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+        try:
+            await safe_request(
+                query.edit_message_text,
+                text,
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+        except:
+            pass
     
     elif data == "add_exception_btn":
-        await query.edit_message_text(
-            "Чтобы добавить исключение:\n"
-            "1. Ответьте на сообщение пользователя\n"
-            "2. Напишите !искл\n\n"
-            "Или укажите ID пользователя:\n"
-            "!искл 123456789"
-        )
+        text = """Чтобы добавить исключение:
+1. Ответьте на сообщение пользователя
+2. Напишите !искл
+
+Или укажите ID пользователя:
+!искл 123456789"""
+        try:
+            await safe_request(query.edit_message_text, text)
+        except:
+            pass
     
     elif data == "remove_exception_btn":
-        await query.edit_message_text(
-            "Чтобы удалить исключение:\n"
-            "1. Ответьте на сообщение пользователя\n"
-            "2. Напишите !нискл\n\n"
-            "Или укажите ID пользователя:\n"
-            "!нискл 123456789"
-        )
+        text = """Чтобы удалить исключение:
+1. Ответьте на сообщение пользователя
+2. Напишите !нискл
+
+Или укажите ID пользователя:
+!нискл 123456789"""
+        try:
+            await safe_request(query.edit_message_text, text)
+        except:
+            pass
     
     elif data == "add_admin_btn":
-        await query.edit_message_text(
-            "Чтобы добавить админа (только владелец):\n"
-            "1. Ответьте на сообщение пользователя\n"
-            "2. Напишите !адм\n\n"
-            "Или укажите ID пользователя:\n"
-            "!адм 123456789"
-        )
+        text = """Чтобы добавить админа (только владелец):
+1. Ответьте на сообщение пользователя
+2. Напишите !адм
+
+Или укажите ID пользователя:
+!адм 123456789"""
+        try:
+            await safe_request(query.edit_message_text, text)
+        except:
+            pass
     
     elif data == "remove_admin_btn":
-        await query.edit_message_text(
-            "Чтобы удалить админа (только владелец):\n"
-            "1. Ответьте на сообщение пользователя\n"
-            "2. Напишите !снять\n\n"
-            "Или укажите ID пользователя:\n"
-            "!снять 123456789"
-        )
+        text = """Чтобы удалить админа (только владелец):
+1. Ответьте на сообщение пользователя
+2. Напишите !снять
+
+Или укажите ID пользователя:
+!снять 123456789"""
+        try:
+            await safe_request(query.edit_message_text, text)
+        except:
+            pass
 
 async def parameter_input_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if "parameter" not in context.user_data:
@@ -1264,7 +1572,10 @@ async def parameter_input_handler(update: Update, context: ContextTypes.DEFAULT_
         return
     
     if not db.is_bot_admin(chat_id, update.effective_user.id):
-        await update.message.reply_text("Требуются права админа бота.")
+        try:
+            await safe_request(update.message.reply_text, "Требуются права админа бота.")
+        except:
+            pass
         return
     
     try:
@@ -1285,20 +1596,29 @@ async def parameter_input_handler(update: Update, context: ContextTypes.DEFAULT_
         if parameter in limits:
             min_val, max_val = limits[parameter]
             if value < min_val or value > max_val:
-                await update.message.reply_text(f"От {min_val} до {max_val}")
+                try:
+                    await safe_request(update.message.reply_text, f"От {min_val} до {max_val}")
+                except:
+                    pass
                 return
         
         settings = db.get_chat_settings(chat_id)
         settings[parameter] = value
         db.save_chat_settings(chat_id, settings)
         
-        await update.message.reply_text(f"✅ Установлено: {value}")
+        try:
+            await safe_request(update.message.reply_text, f"✅ Установлено: {value}")
+        except:
+            pass
         
         del context.user_data["parameter"]
         del context.user_data["chat"]
         
     except ValueError:
-        await update.message.reply_text("Введите число")
+        try:
+            await safe_request(update.message.reply_text, "Введите число")
+        except:
+            pass
 
 # ============ ВЕБ-СЕРВЕР ============
 
@@ -1467,30 +1787,6 @@ class WebHandler(BaseHTTPRequestHandler):
                     </div>
                     
                     <div class="section">
-                        <h2>КОМАНДЫ</h2>
-                        <div class="commands">
-                            <div class="command">
-                                <strong>/setup</strong> - Настройка бота в чате
-                            </div>
-                            <div class="command">
-                                <strong>!адм</strong> - Добавить админа бота (ответ на сообщение)
-                            </div>
-                            <div class="command">
-                                <strong>!искл</strong> - Добавить исключение (ответ на сообщение)
-                            </div>
-                            <div class="command">
-                                <strong>/lock</strong> - Блокировка чата
-                            </div>
-                            <div class="command">
-                                <strong>/unlock</strong> - Разблокировка чата
-                            </div>
-                            <div class="command">
-                                <strong>/stats</strong> - Статистика чата
-                            </div>
-                        </div>
-                    </div>
-                    
-                    <div class="section">
                         <h2>СОГЛАШЕНИЕ</h2>
                         <div style="color: #ccc;">
                             <p>Бот предназначен исключительно для защиты Telegram чатов.</p>
@@ -1540,87 +1836,106 @@ async def main():
     web_thread.start()
     print("✅ Веб-сервер запущен")
     
-    # Создание приложения бота
-    application = Application.builder().token(TOKEN).build()
+    # Настройка бота с повторными попытками
+    max_retries = 5
+    retry_delay = 10
     
-    # Регистрация команд
-    commands = [
-        ("start", start_command),
-        ("setup", setup_command),
-        ("settings", settings_command),
-        ("status", status_command),
-        ("lock", lock_command),
-        ("unlock", unlock_command),
-        ("slow", slow_command),
-        ("normal", normal_command),
-        ("admins", admins_command),
-        ("exceptions", exceptions_command),
-        ("stats", stats_command),
-        ("logs", logs_command),
-        ("help", start_command),
-    ]
-    
-    for command, handler in commands:
-        application.add_handler(CommandHandler(command, handler))
-    
-    # Команды через ! (реакции на сообщения)
-    exclamation_commands = [
-        ("адм", add_admin_command),
-        ("снять", remove_admin_command),
-        ("искл", add_exception_command),
-        ("нискл", remove_exception_command),
-        ("варн", add_warning_command),
-        ("варны", check_warnings_command),
-        ("снятьварны", clear_warnings_command),
-    ]
-    
-    for command, handler in exclamation_commands:
-        application.add_handler(MessageHandler(
-            filters.Regex(f'^!{command}') & ~filters.COMMAND,
-            handler
-        ))
-    
-    # Инлайн-кнопки
-    application.add_handler(CallbackQueryHandler(button_handler))
-    
-    # Обработчик ввода параметров
-    application.add_handler(MessageHandler(
-        filters.TEXT & ~filters.COMMAND,
-        parameter_input_handler
-    ))
-    
-    # Основной обработчик сообщений
-    application.add_handler(MessageHandler(
-        filters.ALL & ~filters.COMMAND,
-        message_handler
-    ))
-    
-    # Запуск бота
-    print("🤖 Anti-Raid Bot запущен")
-    print("=" * 50)
-    print("📋 Основные команды:")
-    print("  /setup - Настройка защиты")
-    print("  !адм - Добавить админа (ответ на сообщение)")
-    print("  !искл - Добавить исключение (ответ на сообщение)")
-    print("  /lock - Блокировка чата")
-    print("=" * 50)
-    print("✅ Все команды работают")
-    
-    # Автосохранение базы данных
-    async def auto_save():
-        while True:
-            await asyncio.sleep(300)  # Каждые 5 минут
-            db.conn.commit()
-            print("💾 База данных сохранена")
-    
-    asyncio.create_task(auto_save())
-    
-    await application.initialize()
-    await application.start()
-    await application.updater.start_polling()
-    
-    # Бесконечный цикл
-    await asyncio.Event().wait()
+    for attempt in range(max_retries):
+        try:
+            # Создание приложения бота
+            application = Application.builder().token(TOKEN).build()
+            
+            # Регистрация команд
+            commands = [
+                ("start", start_command),
+                ("setup", setup_command),
+                ("settings", settings_command),
+                ("status", status_command),
+                ("lock", lock_command),
+                ("unlock", unlock_command),
+                ("slow", slow_command),
+                ("normal", normal_command),
+                ("admins", admins_command),
+                ("exceptions", exceptions_command),
+                ("stats", stats_command),
+                ("logs", logs_command),
+                ("help", start_command),
+            ]
+            
+            for command, handler in commands:
+                application.add_handler(CommandHandler(command, handler))
+            
+            # Команды через ! (реакции на сообщения)
+            exclamation_commands = [
+                ("адм", add_admin_command),
+                ("снять", remove_admin_command),
+                ("искл", add_exception_command),
+                ("нискл", remove_exception_command),
+                ("варн", add_warning_command),
+                ("варны", check_warnings_command),
+                ("снятьварны", clear_warnings_command),
+            ]
+            
+            for command, handler in exclamation_commands:
+                application.add_handler(MessageHandler(
+                    filters.Regex(f'^!{command}') & ~filters.COMMAND,
+                    handler
+                ))
+            
+            # Инлайн-кнопки
+            application.add_handler(CallbackQueryHandler(button_handler))
+            
+            # Обработчик ввода параметров
+            application.add_handler(MessageHandler(
+                filters.TEXT & ~filters.COMMAND,
+                parameter_input_handler
+            ))
+            
+            # Основной обработчик сообщений
+            application.add_handler(MessageHandler(
+                filters.ALL & ~filters.COMMAND,
+                message_handler
+            ))
+            
+            # Запуск бота
+            print("🤖 Запуск Anti-Raid Bot...")
+            print("=" * 50)
+            print("📋 Основные команды:")
+            print("  /setup - Настройка защиты")
+            print("  !адм - Добавить админа (ответ на сообщение)")
+            print("  !искл - Добавить исключение (ответ на сообщение)")
+            print("  /lock - Блокировка чата")
+            print("=" * 50)
+            print("✅ Все команды работают")
+            
+            # Автосохранение базы данных
+            async def auto_save():
+                while True:
+                    await asyncio.sleep(300)  # Каждые 5 минут
+                    db.conn.commit()
+            
+            asyncio.create_task(auto_save())
+            
+            await application.initialize()
+            await application.start()
+            await application.updater.start_polling()
+            
+            print("🚀 Бот успешно запущен")
+            
+            # Бесконечный цикл
+            await asyncio.Event().wait()
+            
+            break  # Успешный запуск, выходим из цикла
+            
+        except Exception as e:
+            logger.error(f"Ошибка запуска бота (попытка {attempt + 1}/{max_retries}): {e}")
+            if attempt < max_retries - 1:
+                print(f"⏳ Повторная попытка через {retry_delay} секунд...")
+                await asyncio.sleep(retry_delay)
+                retry_delay *= 2  # Экспоненциальная задержка
+            else:
+                print("❌ Не удалось запустить бота после нескольких попыток")
+                raise
 
 if __name__ == "__main__":
     # Создание необходимых файлов
@@ -1646,7 +1961,7 @@ if __name__ == "__main__":
         print("\n👋 Остановка бота...")
         db.conn.close()
     except Exception as e:
-        print(f"❌ Ошибка: {e}")
+        print(f"❌ Критическая ошибка: {e}")
         import traceback
         traceback.print_exc()
         db.conn.close()
